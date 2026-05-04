@@ -1,0 +1,945 @@
+#!/usr/bin/env python3
+"""
+Medical Monitor - unified ckb-next animation.
+
+Simulates a hospital bedside monitor showing several patient vitals across
+different keyboard zones, with a defibrillator state machine triggered by
+typing inactivity.
+
+Copyright (c) 2026 Preston A. Elder <prez@neuromancy.net>.
+Licensed under the MIT License -- see the LICENSE file in the project
+repository for the full text.
+
+Designed and refined by Preston A. Elder <prez@neuromancy.net>.
+Code authored by Claude AI under Preston's direction.
+
+Tested on a Corsair K70. Zone layouts (especially the numpad and media
+keys) assume that hardware; other ckb-next-supported keyboards should
+work but visuals may not line up exactly.
+
+Zones:
+  * Main keyboard (caps -> enter)        -- ECG sinus rhythm trace
+  * Numpad                                -- Pulse-ox plethysmograph
+  * Nav cluster (prtscn..pgdn)            -- Respiratory rate (slow breathing)
+  * Media keys (stop/prev/play/next)      -- Defibrillator charge bar
+
+States:
+  NORMAL    -- default. ECG sinus rhythm, pulse-ox, slow breathing.
+  STRESSED  -- triggered by recent typing. ECG goes vfib (random forward
+               path), breathing speeds up, pulse-ox stays on. Per-key
+               red flash on each keypress.
+  CHARGING  -- after `defib_idle` seconds idle. ECG flatlines. Pulse-ox
+               replaced by static X on numpad. Breathing stops (apnea).
+               Media keys progressively light up over `defib_charge`
+               seconds. Aborted if user types again.
+  FLATLINE  -- brief pause after charge complete, before flash sequence.
+  FLASH/GAP -- discharge sequence: FLASH1 (0.15s) -> GAP1 (1.0s) ->
+               FLASH2 (0.15s) -> GAP2 (0.2s) -> FLASH3 (0.15s).
+               Whole keyboard goes red.
+  RECOVERY  -- snap back to NORMAL after FLASH3.
+
+Parameters:
+  bpm                Normal heart rate (BPM, default 60 = 1 beat/sec)
+  vfib_bpm           Heart rate during vfib/STRESSED (default 150)
+  tracecolor         Trace color for all waveforms (default ffffffff)
+  flashcolor         Discharge flash color (default ffff0000, full red)
+  stressed           Bool, enable STRESSED state on typing (default 1)
+  defib_idle         Sec idle before defib charge starts (default 2.0,
+                     0 disables defib entirely)
+  defib_charge       Sec to charge across all 4 media keys (default 8.0)
+  breathing_normal   Breath cycle duration in NORMAL (sec, default 4.0)
+  breathing_stressed Breath cycle duration in STRESSED (sec, default 1.5)
+
+Install:
+  Drop this file (executable) into your user-local ckb-next animations
+  directory, then have the GUI re-scan its scripts. No sudo, no daemon
+  restart, no GUI restart needed:
+
+    mkdir -p ~/.local/share/ckb-next/animations
+    cp medical-monitor ~/.local/share/ckb-next/animations/
+    chmod +x ~/.local/share/ckb-next/animations/medical-monitor
+
+  Then in ckb-next: Settings -> Animation Scripts -> Re-scan. The
+  animation appears in the Lighting tab as "Medical Monitor".
+
+  In the animation's Properties -> Settings -> Playback:
+    * Enable "Start with mode" so the animation runs whenever the mode
+      is active.
+    * Enable "Start with key press" with "on pressed key" selected.
+      This is what delivers per-key events to the script and is
+      REQUIRED for the per-key red flashes, the STRESSED state,
+      and the "abort defib charge by typing" behavior.
+"""
+import sys
+import math
+import os
+import random
+import time as _time
+
+
+# === Debug logging =========================================================
+
+_DEBUG_LOG = None
+_DEBUG_FRAME_COUNT = 0
+_DEBUG_LOG_PATH = "/tmp/ckb-ekg-debug.log"
+
+
+def dbg(msg):
+    global _DEBUG_LOG
+    if _DEBUG_LOG is None:
+        try:
+            _DEBUG_LOG = open(_DEBUG_LOG_PATH, "a")
+            _DEBUG_LOG.write(f"\n=== Medical Monitor started "
+                             f"pid={os.getpid()} uid={os.getuid()} "
+                             f"time={_time.strftime('%Y-%m-%d %H:%M:%S')} ===\n")
+            _DEBUG_LOG.flush()
+        except Exception:
+            return
+    try:
+        _DEBUG_LOG.write(msg + "\n")
+        _DEBUG_LOG.flush()
+    except Exception:
+        pass
+
+
+# === Protocol helpers ======================================================
+
+def _need_encode(c):
+    o = ord(c)
+    return (o <= 0x2C or o == 0x2F or 0x3A <= o <= 0x40
+            or o == 0x5B or o == 0x5D or o >= 0x7F)
+
+
+def url_encode(s):
+    out = []
+    for c in s:
+        if _need_encode(c):
+            out.append("%{:02X}".format(ord(c)))
+        else:
+            out.append(c)
+    return "".join(out)
+
+
+def url_decode(s):
+    out, i = [], 0
+    while i < len(s):
+        if s[i] == "%" and i + 2 < len(s):
+            try:
+                out.append(chr(int(s[i + 1:i + 3], 16)))
+                i += 3
+                continue
+            except ValueError:
+                pass
+        out.append(s[i])
+        i += 1
+    return "".join(out)
+
+
+def read_words():
+    line = sys.stdin.readline()
+    if not line:
+        return ("", "", "")
+    parts = line.strip().split(None, 2)
+    while len(parts) < 3:
+        parts.append("")
+    return (url_decode(parts[0]), url_decode(parts[1]), url_decode(parts[2]))
+
+
+def emit(s): sys.stdout.write(s)
+def emit_line(s): sys.stdout.write(s + "\n")
+def flush(): sys.stdout.flush()
+
+
+def _parse_argb(value):
+    if len(value) >= 8:
+        return (int(value[0:2], 16), int(value[2:4], 16),
+                int(value[4:6], 16), int(value[6:8], 16))
+    raise ValueError(value)
+
+
+# === Plugin info ===========================================================
+
+def ckb_info():
+    emit("guid "); emit(url_encode("{C4D2A3B4-5C6D-7E8F-9012-345678ABCDEF}")); emit_line("")
+    emit("name "); emit(url_encode("Medical Monitor")); emit_line("")
+    emit("version "); emit(url_encode("2.0")); emit_line("")
+    emit_line("year 2026")
+    emit("author "); emit(url_encode("Preston A. Elder <prez@neuromancy.net>")); emit_line("")
+    emit("license "); emit(url_encode("MIT")); emit_line("")
+    emit("description "); emit(url_encode(
+        "Hospital monitor: ECG, pulse-ox, breathing, and defib. "
+        "Stressed (vfib) on typing; charges and shocks on idle.")); emit_line("")
+
+    emit("param double bpm "); emit(url_encode("Heart rate (BPM):"))
+    emit(" "); emit(url_encode("BPM")); emit_line(" 60.0 30.0 200.0")
+    emit("param double vfib_bpm "); emit(url_encode("VFib heart rate (BPM):"))
+    emit(" "); emit(url_encode("BPM")); emit_line(" 150.0 60.0 300.0")
+    emit("param argb tracecolor "); emit(url_encode("Trace color:"))
+    emit(" "); emit(url_encode("")); emit_line(" ffffffff")
+    emit("param argb flashcolor "); emit(url_encode("Defib flash color:"))
+    emit(" "); emit(url_encode("")); emit_line(" ffff0000")
+    emit("param bool stressed "); emit(url_encode("Stressed/vfib on typing")); emit_line(" 1")
+    emit("param double defib_idle "); emit(url_encode("Idle sec before defib:"))
+    emit(" "); emit(url_encode("seconds, 0=off")); emit_line(" 2.0 0.0 60.0")
+    emit("param double defib_charge "); emit(url_encode("Defib charge time:"))
+    emit(" "); emit(url_encode("seconds")); emit_line(" 8.0 1.0 30.0")
+    emit("param double breathing_normal "); emit(url_encode("Breath cycle (normal):"))
+    emit(" "); emit(url_encode("seconds")); emit_line(" 4.0 1.0 10.0")
+    emit("param double breathing_stressed "); emit(url_encode("Breath cycle (stressed):"))
+    emit(" "); emit(url_encode("seconds")); emit_line(" 1.5 0.5 5.0")
+
+    emit_line("kpmode name")
+    emit_line("time absolute")
+    emit_line("repeat off")
+    emit_line("preempt off")
+    emit_line("parammode live")
+
+    emit_line("preset Default bpm=60.0 vfib_bpm=150.0 tracecolor=ffffffff "
+              "flashcolor=ffff0000 stressed=1 defib_idle=2.0 "
+              "defib_charge=8.0 breathing_normal=4.0 breathing_stressed=1.5")
+    emit_line("preset Calm bpm=50.0 vfib_bpm=120.0 tracecolor=ff00ffff "
+              "flashcolor=ffff00aa stressed=0 defib_idle=0 "
+              "defib_charge=8.0 breathing_normal=5.0 breathing_stressed=2.0")
+    emit_line("preset NoDefib bpm=60.0 vfib_bpm=150.0 tracecolor=ffffffff "
+              "flashcolor=ffff0000 stressed=1 defib_idle=0 "
+              "defib_charge=8.0 breathing_normal=4.0 breathing_stressed=1.5")
+    flush()
+
+
+# === Constants =============================================================
+
+# ECG sinus rhythm path through main keyboard (carefully tuned)
+ECG_PATH = [
+    "caps", "q", "a", "z", "s", "e", "4", "f4",
+    "5", "t", "g", "b", "space", "n", "j", "k",
+    "o", "0", "p", "colon", "quote", "enter",
+]
+
+# Pulse-ox path through numpad. The wave SHAPE is encoded in the path's
+# vertical motion across rows, not in brightness. The cursor traces:
+#   * num1 -> num4 -> num7 -> numlock     -- steep rise on left column
+#   * numlock -> numslash                 -- brief plateau at peak
+#   * numslash -> num8 -> num5 -> num2    -- descent on middle column
+#   * num2 -> numstar                     -- sharp DICROTIC NOTCH (back up)
+#   * numstar -> num9 -> num6 -> num3 -> numdot   -- final descent to baseline
+# The right column (numminus/numplus/numenter) and num0 are intentionally
+# left dark; they're not part of the wave.
+PULSEOX_PATH = [
+    "num1", "num4", "num7", "numlock",
+    "numslash",
+    "num8", "num5", "num2",
+    "numstar",
+    "num9", "num6", "num3", "numdot",
+]
+
+# Respiration: 3x3 nav cluster
+RESP_KEYS = [
+    "prtscn", "scroll", "pause",
+    "ins", "home", "pgup",
+    "del", "end", "pgdn",
+]
+
+# Media keys for defib charge bar (in order, charging left-to-right)
+MEDIA_KEYS = ["stop", "prev", "play", "next"]
+
+# X pattern on numpad during charging/flatline/flash (corners + center)
+X_PATTERN_KEYS = ["num7", "num9", "num5", "num1", "num3"]
+
+# Flatline path: home row only, traced with cursor like a real monitor
+# during asystole. Used during CHARGING/FLATLINE/GAP states.
+FLATLINE_PATH = [
+    "caps", "a", "s", "d", "f", "g", "h", "j", "k", "l",
+    "colon", "quote", "enter",
+]
+
+
+# Keys excluded from vfib pool (numpad, nav cluster, media, modifier keys
+# at non-aligned x positions, etc.) Modifier keys break the constrained
+# random walk because they live at unique x-positions where no other row
+# has a key, forcing huge vertical jumps. Filtering them keeps the vfib
+# trace looking like a line that wanders within ±2 rows.
+VFIB_EXCLUDE = set(PULSEOX_PATH + RESP_KEYS + MEDIA_KEYS + [
+    "up", "down", "left", "right",
+    "mute", "volup", "voldn", "light", "lock",
+    # Modifier keys (non-aligned x positions on most keyboards)
+    "lshift", "rshift", "lctrl", "rctrl", "lwin", "rwin",
+    "lalt", "ralt", "rmenu",
+])
+
+
+# Animation states
+S_NORMAL = "NORMAL"
+S_STRESSED = "STRESSED"
+S_CHARGING = "CHARGING"
+S_FLATLINE = "FLATLINE"
+S_FLASH1 = "FLASH1"
+S_GAP1 = "GAP1"
+S_FLASH2 = "FLASH2"
+S_GAP2 = "GAP2"
+S_FLASH3 = "FLASH3"
+
+# Flash sequence timings
+FLASH_DURATION = 0.15
+GAP1_DURATION = 1.0
+GAP2_DURATION = 0.1
+FLATLINE_DURATION = 0.5
+STRESSED_COOLDOWN = 0.5    # sec after last keypress before STRESSED -> NORMAL
+
+
+# === Animation =============================================================
+
+class Key:
+    __slots__ = ("name", "x", "y", "a", "r", "g", "b")
+
+    def __init__(self, name, x, y):
+        self.name = name
+        self.x, self.y = x, y
+        self.a = self.r = self.g = self.b = 0
+
+
+class MedicalMonitor:
+    def __init__(self):
+        self.keys = []
+        self.keys_by_name = {}
+
+        # Resolved key references: list of (key_idx, key_obj) for each zone
+        self.ecg_path_keys = []
+        self.pulseox_path_keys = []
+        self.resp_keys_resolved = []
+        self.media_keys_resolved = []
+        self.x_pattern_resolved = []
+        self.flatline_path_keys = []
+        # VFib pool: organized by x-buckets (bucket width 9 captures
+        # multi-row x positions despite keyboard staggering).
+        # bucket_idx -> {row_y -> (key_idx, key_obj)}
+        self.vfib_pool_by_bucket = {}
+        self.vfib_buckets = []           # sorted bucket indices
+        self.vfib_y_values = []          # sorted y values in pool
+        self.vfib_y_index = {}           # y -> index in y_values
+
+        # Timing / state
+        self.t = 0.0
+        self.state = S_NORMAL
+        self.state_t = 0.0
+        self.last_keypress_t = -999.0
+        self.armed = False               # True after user has typed; False
+                                         # again after a successful defib.
+                                         # Only when True does idle trigger
+                                         # CHARGING.
+        self.flash = {}                  # per-key keypress flash decays
+        self.vfib_path = []              # current vfib path
+        self.vfib_seed = 1
+        self.last_ecg_cursor_norm = 0.0  # track wraps for path regeneration
+
+        # Parameters
+        self.bpm = 60.0                  # Normal heart rate (60 bpm = 1.0s sweep)
+        self.vfib_bpm = 150.0            # VFib heart rate (faster, chaotic)
+        self.trace_argb = (255, 255, 255, 255)
+        self.flash_argb = (255, 255, 0, 0)
+        self.shock_argb = (255, 255, 0, 0)
+        self.shock_duration = 0.4
+        self.stressed_enabled = True
+        self.defib_idle = 2.0
+        self.defib_charge = 8.0
+        self.breathing_normal = 4.0
+        self.breathing_stressed = 1.5
+
+    def init(self):
+        if not self.keys:
+            return
+        self.keys_by_name = {k.name: i for i, k in enumerate(self.keys)}
+
+        dbg(f"init: received {len(self.keys)} keys")
+
+        def resolve(names):
+            out = []
+            missing = []
+            for n in names:
+                i = self.keys_by_name.get(n)
+                if i is not None:
+                    out.append((i, self.keys[i]))
+                else:
+                    missing.append(n)
+            return out, missing
+
+        # ECG path
+        self.ecg_path_keys, miss = resolve(ECG_PATH)
+        dbg(f"init: ECG path: {len(self.ecg_path_keys)}/{len(ECG_PATH)} keys"
+            + (f" (missing: {miss})" if miss else ""))
+
+        # Pulse-ox path
+        self.pulseox_path_keys, miss = resolve(PULSEOX_PATH)
+        dbg(f"init: pulse-ox path: {len(self.pulseox_path_keys)}/"
+            f"{len(PULSEOX_PATH)} keys"
+            + (f" (missing: {miss})" if miss else ""))
+
+        # Respiration
+        self.resp_keys_resolved, miss = resolve(RESP_KEYS)
+        dbg(f"init: respiration: {len(self.resp_keys_resolved)} keys"
+            + (f" (missing: {miss})" if miss else ""))
+
+        # Media keys (charge bar)
+        self.media_keys_resolved, miss = resolve(MEDIA_KEYS)
+        dbg(f"init: media keys: {len(self.media_keys_resolved)}"
+            + (f" (missing: {miss})" if miss else ""))
+
+        # X pattern
+        self.x_pattern_resolved, miss = resolve(X_PATTERN_KEYS)
+        dbg(f"init: X pattern: {len(self.x_pattern_resolved)}"
+            + (f" (missing: {miss})" if miss else ""))
+
+        # Flatline path (home row sweep)
+        self.flatline_path_keys, _ = resolve(FLATLINE_PATH)
+        dbg(f"init: flatline path: {len(self.flatline_path_keys)}")
+
+        # VFib pool: organized in x-buckets (bucket width 9) so that
+        # staggered keys at slightly different x land in the same bucket.
+        # This gives multiple row choices at each path step, allowing the
+        # constrained random walk to actually wander between rows.
+        VFIB_BUCKET_WIDTH = 9
+        self.vfib_pool_by_bucket = {}
+        for i, k in enumerate(self.keys):
+            if k.name in VFIB_EXCLUDE:
+                continue
+            if not (14 <= k.y <= 75):
+                continue
+            bucket = k.x // VFIB_BUCKET_WIDTH
+            ymap = self.vfib_pool_by_bucket.setdefault(bucket, {})
+            # If bucket already has a key in this row, keep whichever is
+            # closer to the bucket center for cleaner visual placement
+            if k.y in ymap:
+                bucket_cx = (bucket + 0.5) * VFIB_BUCKET_WIDTH
+                if abs(k.x - bucket_cx) < abs(ymap[k.y][1].x - bucket_cx):
+                    ymap[k.y] = (i, k)
+            else:
+                ymap[k.y] = (i, k)
+        self.vfib_buckets = sorted(self.vfib_pool_by_bucket.keys())
+        all_ys = set()
+        for ymap in self.vfib_pool_by_bucket.values():
+            all_ys.update(ymap.keys())
+        self.vfib_y_values = sorted(all_ys)
+        self.vfib_y_index = {y: idx for idx, y in enumerate(self.vfib_y_values)}
+        total = sum(len(m) for m in self.vfib_pool_by_bucket.values())
+        avg_rows = total / max(1, len(self.vfib_buckets))
+        dbg(f"init: vfib pool: {total} keys across {len(self.vfib_buckets)} "
+            f"x-buckets (avg {avg_rows:.1f} rows/bucket) and "
+            f"{len(self.vfib_y_values)} rows total")
+
+    def set_param(self, name, value):
+        try:
+            if name == "bpm":
+                self.bpm = max(20.0, float(value))
+            elif name == "vfib_bpm":
+                self.vfib_bpm = max(40.0, float(value))
+            elif name == "tracecolor":
+                self.trace_argb = _parse_argb(value)
+            elif name == "flashcolor":
+                self.flash_argb = _parse_argb(value)
+                self.shock_argb = _parse_argb(value)
+            elif name == "stressed":
+                self.stressed_enabled = bool(int(value))
+            elif name == "defib_idle":
+                self.defib_idle = max(0.0, float(value))
+            elif name == "defib_charge":
+                self.defib_charge = max(0.5, float(value))
+            elif name == "breathing_normal":
+                self.breathing_normal = max(0.5, float(value))
+            elif name == "breathing_stressed":
+                self.breathing_stressed = max(0.3, float(value))
+        except (ValueError, TypeError):
+            pass
+
+    def _ecg_sweep(self):
+        """ECG sweep duration in seconds, computed from current BPM
+        depending on state. One full sweep = one full heartbeat."""
+        if self.state == S_STRESSED:
+            return 60.0 / self.vfib_bpm
+        return 60.0 / self.bpm
+
+    def _pulseox_sweep(self):
+        """Pulse-ox sweep is slightly slower than ECG (5%) so the two
+        traces drift relative to each other, like real medical instruments
+        (ECG measures electrical activity instantaneously; pulse-ox lags
+        because peripheral pulse is delayed)."""
+        return self._ecg_sweep() * 1.05
+
+    def _flatline_sweep(self):
+        """Flatline keeps sweeping at the normal-state BPM rate, since
+        the patient is no longer actively beating but the monitor itself
+        keeps running at its display sweep rate."""
+        return 60.0 / self.bpm
+
+    def keypress(self, name, down):
+        if not down:
+            return
+        self.last_keypress_t = self.t
+        self.armed = True
+        i = self.keys_by_name.get(name)
+        if i is not None:
+            self.flash[i] = self.shock_duration
+
+    def advance(self, dt):
+        if dt <= 0:
+            return
+        self.t += dt
+        self.state_t += dt
+
+        # Decay keypress flashes
+        for i in list(self.flash.keys()):
+            self.flash[i] -= dt
+            if self.flash[i] <= 0:
+                del self.flash[i]
+
+        # State transitions
+        time_since_keypress = self.t - self.last_keypress_t
+        recent_keypress = time_since_keypress < STRESSED_COOLDOWN
+
+        prev_state = self.state
+
+        if self.state == S_NORMAL:
+            if self.stressed_enabled and recent_keypress:
+                self._enter_state(S_STRESSED)
+            elif (self.armed and self.defib_idle > 0
+                  and time_since_keypress >= self.defib_idle):
+                self._enter_state(S_CHARGING)
+        elif self.state == S_STRESSED:
+            if self.defib_idle > 0 and self.armed:
+                # Defib enabled: stay in STRESSED indefinitely until charge
+                # starts (we don't return to NORMAL spontaneously after vfib)
+                if not recent_keypress and time_since_keypress >= self.defib_idle:
+                    self._enter_state(S_CHARGING)
+            else:
+                # Defib disabled: return to NORMAL after typing cooldown
+                if not recent_keypress:
+                    self._enter_state(S_NORMAL)
+        elif self.state == S_CHARGING:
+            if recent_keypress:
+                # User typed during charge -- abort, go back to stressed
+                self._enter_state(S_STRESSED if self.stressed_enabled else S_NORMAL)
+            elif self.state_t >= self.defib_charge:
+                self._enter_state(S_FLATLINE)
+        elif self.state == S_FLATLINE:
+            if self.state_t >= FLATLINE_DURATION:
+                self._enter_state(S_FLASH1)
+        elif self.state == S_FLASH1:
+            if self.state_t >= FLASH_DURATION:
+                self._enter_state(S_GAP1)
+        elif self.state == S_GAP1:
+            if self.state_t >= GAP1_DURATION:
+                self._enter_state(S_FLASH2)
+        elif self.state == S_FLASH2:
+            if self.state_t >= FLASH_DURATION:
+                self._enter_state(S_GAP2)
+        elif self.state == S_GAP2:
+            if self.state_t >= GAP2_DURATION:
+                self._enter_state(S_FLASH3)
+        elif self.state == S_FLASH3:
+            if self.state_t >= FLASH_DURATION:
+                # Successful defib! Patient is "recovered." Disarm so we
+                # don't re-charge until user types again.
+                self.armed = False
+                self._enter_state(S_NORMAL)
+
+        if prev_state != self.state:
+            dbg(f"state: {prev_state} -> {self.state} at t={self.t:.2f}")
+
+    def _enter_state(self, new_state):
+        self.state = new_state
+        self.state_t = 0.0
+
+    def _generate_vfib_path(self):
+        """Generate a chaotic forward-moving line for vfib visual.
+
+        Walks through x-buckets in order; at each bucket picks a row
+        within ±2 of the previous row (when possible). Produces a
+        wandering line that looks chaotic but maintains visual continuity.
+        """
+        rng = random.Random(self.vfib_seed)
+        self.vfib_seed += 1
+
+        if not self.vfib_buckets:
+            return []
+
+        path = []
+        n_rows = len(self.vfib_y_values)
+        prev_y_idx = n_rows // 2 + rng.randint(-1, 1)
+        prev_y_idx = max(0, min(n_rows - 1, prev_y_idx))
+
+        for bucket in self.vfib_buckets:
+            ymap = self.vfib_pool_by_bucket[bucket]
+            available_y_idxs = sorted(self.vfib_y_index[y] for y in ymap.keys())
+            close = [yi for yi in available_y_idxs
+                     if abs(yi - prev_y_idx) <= 2]
+            if not close:
+                close = [min(available_y_idxs,
+                             key=lambda yi: abs(yi - prev_y_idx))]
+            weights = [1.0 / (1 + abs(yi - prev_y_idx)) for yi in close]
+            total_w = sum(weights)
+            r = rng.random() * total_w
+            chosen_idx = close[0]
+            acc = 0.0
+            for yi, w in zip(close, weights):
+                acc += w
+                if r <= acc:
+                    chosen_idx = yi
+                    break
+            chosen_y = self.vfib_y_values[chosen_idx]
+            path.append(ymap[chosen_y])
+            prev_y_idx = chosen_idx
+
+        return path
+
+    def render(self):
+        # All keys default to alpha=0 (transparent)
+        for k in self.keys:
+            k.a = k.r = k.g = k.b = 0
+
+        # Render zones according to state
+        if self.state in (S_FLASH1, S_FLASH2, S_FLASH3):
+            self._render_full_flash()
+            self._render_x_pattern(bright=True)
+            self._render_charge_bar(progress=1.0)
+        else:
+            # ECG zone
+            self._render_ecg()
+            # Numpad zone
+            if self.state in (S_CHARGING, S_FLATLINE,
+                              S_GAP1, S_GAP2):
+                self._render_x_pattern(bright=False)
+            else:
+                self._render_pulseox()
+            # Respiration zone
+            if self.state in (S_NORMAL, S_STRESSED):
+                self._render_respiration()
+            # else: respiration off (dark) for charge/flatline/gaps
+            # Media keys (charge bar)
+            self._render_charge_bar(progress=self._charge_progress())
+
+        # Per-key keypress flashes always render on top
+        self._render_keypress_flashes()
+
+    def _charge_progress(self):
+        if self.state == S_CHARGING:
+            return min(1.0, self.state_t / self.defib_charge)
+        if self.state in (S_FLATLINE, S_GAP1, S_GAP2):
+            return 1.0
+        return 0.0
+
+    def _render_ecg(self):
+        # Flatline during charging/flatline/gap states
+        if self.state in (S_CHARGING, S_FLATLINE, S_GAP1, S_GAP2):
+            self._render_flatline()
+            return
+
+        sweep = self._ecg_sweep()
+        cursor_norm = (self.t / sweep) % 1.0
+
+        # Choose path based on state
+        if self.state == S_STRESSED:
+            # Regenerate vfib path on cursor wrap
+            if cursor_norm < self.last_ecg_cursor_norm or not self.vfib_path:
+                self.vfib_path = self._generate_vfib_path()
+            self.last_ecg_cursor_norm = cursor_norm
+            path = self.vfib_path
+        else:
+            self.last_ecg_cursor_norm = cursor_norm
+            path = self.ecg_path_keys
+
+        if len(path) < 2:
+            return
+
+        ta, tr, tg, tb = self.trace_argb
+        n = len(path)
+        for idx, (key_idx, k) in enumerate(path):
+            position = idx / n
+            distance_back = (cursor_norm - position) % 1.0
+            if distance_back >= 0.95:
+                continue
+            brightness = 1.0 - 0.75 * (distance_back / 0.95)
+            k.a = max(0, min(255, int(ta * brightness)))
+            k.r = max(0, min(255, int(tr * brightness)))
+            k.g = max(0, min(255, int(tg * brightness)))
+            k.b = max(0, min(255, int(tb * brightness)))
+
+    def _render_flatline(self):
+        """Cursor sweeping along home row, like a real monitor's asystole
+        flatline. Same sweep speed as ECG; no peaks, just a flat trace."""
+        if not self.flatline_path_keys:
+            return
+
+        ta, tr, tg, tb = self.trace_argb
+        n = len(self.flatline_path_keys)
+        cursor_norm = (self.t / self._flatline_sweep()) % 1.0
+
+        for idx, (key_idx, k) in enumerate(self.flatline_path_keys):
+            position = idx / n
+            distance_back = (cursor_norm - position) % 1.0
+            if distance_back >= 0.95:
+                continue
+            phosphor = 1.0 - 0.75 * (distance_back / 0.95)
+            # Flatline is dimmer than peaks; max brightness 0.55
+            brightness = phosphor * 0.55
+            k.a = max(k.a, int(ta * brightness))
+            k.r = max(k.r, int(tr * brightness))
+            k.g = max(k.g, int(tg * brightness))
+            k.b = max(k.b, int(tb * brightness))
+
+    def _render_pulseox(self):
+        """Pulse-ox waveform on the numpad. Wave shape encoded in path's
+        vertical motion (rows = amplitude). Cursor sweeps through with
+        phosphor fade, identical model to ECG."""
+        if not self.pulseox_path_keys:
+            return
+
+        sweep = self._pulseox_sweep()
+
+        ta, tr, tg, tb = self.trace_argb
+        cursor_norm = (self.t / sweep) % 1.0
+        n = len(self.pulseox_path_keys)
+
+        for idx, (key_idx, k) in enumerate(self.pulseox_path_keys):
+            position = idx / n
+            distance_back = (cursor_norm - position) % 1.0
+            if distance_back >= 0.95:
+                continue
+            brightness = 1.0 - 0.75 * (distance_back / 0.95)
+            k.a = max(0, min(255, int(ta * brightness)))
+            k.r = max(0, min(255, int(tr * brightness)))
+            k.g = max(0, min(255, int(tg * brightness)))
+            k.b = max(0, min(255, int(tb * brightness)))
+
+    def _render_respiration(self):
+        """Vertical breathing pulse on the nav cluster.
+
+        All three rows pulse together (in sync), but with different baselines:
+          * Bottom row (del/end/pgdn): always at least 0.30 lit
+          * Middle row (ins/home/pgup): no baseline
+          * Top row (prtscn/scroll/pause): no baseline, slightly less amp
+        Result: the whole cluster brightens and dims together, with the
+        bottom always staying at least partially visible. Looks like the
+        chest expanding and contracting.
+        """
+        if not self.resp_keys_resolved:
+            return
+
+        if self.state == S_STRESSED:
+            cycle = self.breathing_stressed
+        else:
+            cycle = self.breathing_normal
+
+        ys = [k.y for _, k in self.resp_keys_resolved]
+        if not ys:
+            return
+        y_min, y_max = min(ys), max(ys)
+        y_range = max(1, y_max - y_min)
+
+        ta, tr, tg, tb = self.trace_argb
+        phase = (self.t / cycle) % 1.0
+        # Sinusoidal expand-contract: 0 -> 1 -> 0 over one cycle
+        wave = math.sin(phase * math.pi) ** 2
+
+        for idx, (key_idx, k) in enumerate(self.resp_keys_resolved):
+            # Vertical position: 0=top, 1=bottom
+            v = (k.y - y_min) / y_range
+            # Per-row baseline: bottom keeps a minimum, top has none.
+            # Linear from 0.30 (bottom) to 0.0 (top).
+            baseline = 0.30 * v
+            # Per-row amplitude: bottom gets the most, top a bit less.
+            # Linear from 0.65 (bottom) to 0.55 (top).
+            amp = 0.55 + 0.10 * v
+            brightness = baseline + amp * wave
+            k.a = max(0, min(255, int(ta * brightness)))
+            k.r = max(0, min(255, int(tr * brightness)))
+            k.g = max(0, min(255, int(tg * brightness)))
+            k.b = max(0, min(255, int(tb * brightness)))
+
+    def _render_charge_bar(self, progress=0.0):
+        """Defib charge bar on media keys.
+
+        Stages: as charge progresses, each key in turn FLASHES while the
+        previous keys stay STEADY. When fully charged (progress >= 1),
+        all keys are steady at full brightness (ready to shock).
+
+        Stage 0 (progress 0-25%): stop flashes
+        Stage 1 (25-50%): stop steady, prev flashes
+        Stage 2 (50-75%): stop+prev steady, play flashes
+        Stage 3 (75-100%): stop+prev+play steady, next flashes
+        Stage 4 (>=100%): all four steady (ready)
+        """
+        if not self.media_keys_resolved:
+            return
+        if progress <= 0:
+            return
+
+        n = len(self.media_keys_resolved)
+        if progress >= 1.0:
+            stage = n  # all steady
+        else:
+            stage = int(progress * n)
+            stage = max(0, min(n - 1, stage))
+
+        # Flash square-wave at 4 Hz (toggles every 0.125s)
+        flash_phase = (self.t * 4) % 1.0
+        flash_bright = flash_phase < 0.5
+
+        for idx, (key_idx, k) in enumerate(self.media_keys_resolved):
+            if idx < stage:
+                # Steady fully on
+                local = 1.0
+            elif idx == stage:
+                # Flashing
+                local = 1.0 if flash_bright else 0.25
+            else:
+                # Not yet
+                continue
+            # Charge bar color: red-orange (yellow-ish for charging warning)
+            k.a = max(k.a, int(255 * local))
+            k.r = max(k.r, int(255 * local))
+            k.g = max(k.g, int(180 * local))
+            k.b = max(k.b, int(40 * local))
+
+    def _render_x_pattern(self, bright=False):
+        """Static red X on the numpad during asystole/charging.
+
+        5 keys forming an X: num7, num9, num5, num1, num3.
+        Always rendered in red (regardless of trace color), bright.
+        """
+        if not self.x_pattern_resolved:
+            return
+        # Always red for the X (asystole indicator)
+        fa, fr, fg, fb = self.flash_argb   # flashcolor parameter (default red)
+        brightness = 1.0 if bright else 0.85
+        for key_idx, k in self.x_pattern_resolved:
+            k.a = max(k.a, int(fa * brightness))
+            k.r = max(k.r, int(fr * brightness))
+            k.g = max(k.g, int(fg * brightness))
+            k.b = max(k.b, int(fb * brightness))
+
+    def _render_full_flash(self):
+        fa, fr, fg, fb = self.flash_argb
+        for k in self.keys:
+            k.a = fa
+            k.r = fr
+            k.g = fg
+            k.b = fb
+
+    def _render_keypress_flashes(self):
+        sa, sr, sg, sb = self.shock_argb
+        for i, t in self.flash.items():
+            if i >= len(self.keys):
+                continue
+            k = self.keys[i]
+            level = max(0.0, min(1.0, t / self.shock_duration))
+            k.a = max(k.a, int(sa * level))
+            k.r = max(k.r, int(sr * level))
+            k.g = int(k.g * (1 - level * 0.85))
+            k.b = int(k.b * (1 - level * 0.85))
+
+
+# === Run loop ==============================================================
+
+def ckb_run():
+    anim = MedicalMonitor()
+
+    cmd, p1, p2 = read_words()
+    while not (cmd == "begin" and p1 == "keymap"):
+        if not cmd: return -1
+        cmd, p1, p2 = read_words()
+    cmd, p1, p2 = read_words()
+    if cmd != "keycount": return -1
+    while True:
+        cmd, p1, p2 = read_words()
+        if cmd == "end" and p1 == "keymap":
+            break
+        if cmd == "key":
+            try:
+                xs, ys = p2.split(",")
+                anim.keys.append(Key(p1, int(xs), int(ys)))
+            except ValueError:
+                continue
+
+    anim.init()
+
+    cmd, p1, p2 = read_words()
+    while not (cmd == "begin" and p1 == "params"):
+        if not cmd: return -1
+        cmd, p1, p2 = read_words()
+    while True:
+        cmd, p1, p2 = read_words()
+        if cmd == "end" and p1 == "params":
+            break
+        if cmd == "param":
+            anim.set_param(p1, p2)
+
+    cmd, p1, p2 = read_words()
+    while not (cmd == "begin" and p1 == "run"):
+        if not cmd: return -1
+        cmd, p1, p2 = read_words()
+    emit_line("begin run")
+    flush()
+
+    dbg("run: protocol initialized, entering main loop")
+    frame_count = 0
+    while True:
+        cmd, p1, p2 = read_words()
+        if not cmd or (cmd == "end" and p1 == "run"):
+            break
+        if cmd == "frame":
+            anim.render()
+            emit_line("begin frame")
+            for k in anim.keys:
+                emit_line("argb {} {:02x}{:02x}{:02x}{:02x}".format(
+                    k.name, k.a, k.r, k.g, k.b))
+            emit_line("end frame")
+            flush()
+            frame_count += 1
+            if frame_count % 60 == 0:
+                dbg(f"run: {frame_count} frames, t={anim.t:.2f}, "
+                    f"state={anim.state}, flashes={len(anim.flash)}")
+        elif cmd == "time":
+            try: dt = float(p1)
+            except ValueError: dt = 0.0
+            anim.advance(dt)
+        elif cmd == "key":
+            # 'key <name> <x>,<y>' or 'key <name> <down|up>'
+            # ckb-next sends: key <name> down/up
+            try:
+                if p2 in ("down", "up", "1", "0"):
+                    down = p2 in ("down", "1")
+                else:
+                    down = True   # default to down event
+                anim.keypress(p1, down)
+            except Exception as e:
+                dbg(f"keypress parse error: {e}")
+        elif cmd == "begin" and p1 == "params":
+            while True:
+                c2, p1b, p2b = read_words()
+                if c2 == "end" and p1b == "params":
+                    break
+                if c2 == "param":
+                    anim.set_param(p1b, p2b)
+        elif cmd in ("start", "stop"):
+            # ckb-next emits these as state signals; we ignore.
+            pass
+        else:
+            dbg(f"run: unhandled command: {cmd!r} {p1!r} {p2!r}")
+
+    emit_line("end run")
+    flush()
+    dbg(f"run: ending after {frame_count} frames")
+    return 0
+
+
+def main():
+    if len(sys.argv) >= 2:
+        if sys.argv[1] == "--ckb-info":
+            ckb_info()
+            return 0
+        if sys.argv[1] == "--ckb-run":
+            return ckb_run()
+    sys.stderr.write("This program must be run from within ckb\n")
+    return -1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

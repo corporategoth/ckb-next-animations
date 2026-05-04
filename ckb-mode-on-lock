@@ -1,0 +1,200 @@
+#!/usr/bin/env python3
+"""ckb-mode-on-lock -- switch ckb-next mode on screen lock/unlock.
+
+Copyright (c) 2026 Preston A. Elder <prez@neuromancy.net>.
+Licensed under the MIT License -- see LICENSE in the project repository.
+
+Designed and refined by Preston A. Elder.
+Code authored by Claude AI under Preston's direction.
+
+Listens for the freedesktop / GNOME ScreenSaver D-Bus signal on the user
+session bus and switches ckb-next's active mode (and optionally profile)
+when the screen locks or unlocks. Cross-DE: KDE Plasma, GNOME, XFCE,
+Cinnamon, MATE, ...
+
+Mode and profile switching is delegated to the `ckb-next` CLI:
+    ckb-next --mode <name>        # switch mode in current profile
+    ckb-next --profile <name>     # switch profile (all devices)
+so any name that works in the GUI works here -- no Qt-config parsing.
+
+----------------------------------------------------------------------
+Configuration sources -- highest priority first:
+
+  1. Environment variables (set by the systemd unit or your shell):
+       CKB_LOCK_MODE_UNLOCKED   mode name to switch to on unlock
+       CKB_LOCK_MODE_LOCKED     mode name to switch to on lock
+       CKB_LOCK_PROFILE         profile name (optional), or "none"
+
+  2. Config file at $XDG_CONFIG_HOME/ckb-next/lock.conf (default
+     ~/.config/ckb-next/lock.conf, alongside ckb-next-gui's own
+     ckb-next.conf):
+       mode_unlocked = ...
+       mode_locked   = ...
+       profile       = ...
+     Lines starting with `#` are comments. Values may be quoted.
+
+  3. The defaults in the CONFIG block below.
+
+Values are passed verbatim to `ckb-next` as a mode/profile name. Set a
+value to `none` (or leave it unset) to skip that switch.
+----------------------------------------------------------------------
+"""
+
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+
+# === CONFIG ================================================================
+# Edit in place, or override via the config file / env vars described in
+# the module docstring above.
+MODE_UNLOCKED = "EKG"             # ckb-next mode name, or None
+MODE_LOCKED   = "BrickBreaker"    # ckb-next mode name, or None
+PROFILE       = None              # ckb-next profile name, or None
+# ===========================================================================
+
+
+CKB_NEXT_BIN = "ckb-next"
+
+
+def log(msg):
+    sys.stdout.write(msg + "\n")
+    sys.stdout.flush()
+
+
+def warn(msg):
+    sys.stderr.write(f"ckb-mode-on-lock: {msg}\n")
+    sys.stderr.flush()
+
+
+# === Config loading ========================================================
+
+def _xdg_config_home():
+    return Path(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"))
+
+
+def _norm(value):
+    """'none' / '' -> None; otherwise -> str. Strips surrounding quotes."""
+    if value is None:
+        return None
+    s = value if isinstance(value, str) else str(value)
+    s = s.strip()
+    if s == "" or s.lower() == "none":
+        return None
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in ("'", '"'):
+        s = s[1:-1]
+    return s
+
+
+def _load_config_file():
+    """Return dict of overrides from lock.conf, or {} if absent."""
+    path = _xdg_config_home() / "ckb-next" / "lock.conf"
+    if not path.is_file():
+        return {}
+    out = {}
+    for raw in path.read_text(errors="replace").splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        out[key.strip().lower()] = val.strip()
+    return out
+
+
+def apply_overrides():
+    """Mutate module-level MODE_UNLOCKED / MODE_LOCKED / PROFILE."""
+    global MODE_UNLOCKED, MODE_LOCKED, PROFILE
+    file_cfg = _load_config_file()
+
+    def pick(env_name, file_key, current):
+        if env_name in os.environ:
+            return _norm(os.environ[env_name])
+        if file_key in file_cfg:
+            return _norm(file_cfg[file_key])
+        return _norm(current)
+
+    MODE_UNLOCKED = pick("CKB_LOCK_MODE_UNLOCKED", "mode_unlocked", MODE_UNLOCKED)
+    MODE_LOCKED   = pick("CKB_LOCK_MODE_LOCKED",   "mode_locked",   MODE_LOCKED)
+    PROFILE       = pick("CKB_LOCK_PROFILE",       "profile",       PROFILE)
+
+
+# === Talking to ckb-next ==================================================
+
+def _run_ckb(*args):
+    log(f"-> {CKB_NEXT_BIN} {' '.join(args)}")
+    try:
+        subprocess.run([CKB_NEXT_BIN, *args], check=False)
+    except FileNotFoundError:
+        warn(f"{CKB_NEXT_BIN!r} not on PATH; cannot switch mode/profile")
+
+
+def switch(mode):
+    if PROFILE is not None:
+        _run_ckb("--profile", PROFILE)
+    if mode is not None:
+        _run_ckb("--mode", mode)
+
+
+# === Lock-event loop ======================================================
+
+DBUS_RULES = (
+    "type='signal',interface='org.freedesktop.ScreenSaver',member='ActiveChanged'",
+    "type='signal',interface='org.gnome.ScreenSaver',member='ActiveChanged'",
+)
+
+
+def event_loop(on_lock, on_unlock, initial_state="unlocked"):
+    """Block on dbus-monitor; dispatch on_lock/on_unlock per signal.
+
+    Some sessions emit both the freedesktop and GNOME ScreenSaver signals
+    for the same lock event. We dedup by state, not by time: ignore any
+    signal whose new state matches the last one we acted on. A real
+    lock-then-unlock toggles state and always fires; a duplicate signal
+    keeps the state, so it gets dropped.
+    """
+    proc = subprocess.Popen(
+        ["dbus-monitor", "--session", *DBUS_RULES],
+        stdout=subprocess.PIPE, text=True, bufsize=1,
+    )
+    last_state = initial_state
+    try:
+        for line in proc.stdout:
+            if "boolean true" in line:
+                state, action = "locked", on_lock
+            elif "boolean false" in line:
+                state, action = "unlocked", on_unlock
+            else:
+                continue
+            if state == last_state:
+                continue
+            last_state = state
+            action()
+    finally:
+        proc.terminate()
+
+
+def main():
+    apply_overrides()
+    log(f"ckb-mode-on-lock starting "
+        f"(unlocked={MODE_UNLOCKED!r}, locked={MODE_LOCKED!r}, "
+        f"profile={PROFILE!r})")
+
+    # Initial state: assume unlocked. The next ActiveChanged event will
+    # correct it if the screen happens to be locked when we start.
+    log("Screen UNLOCKED (initial)")
+    switch(MODE_UNLOCKED)
+
+    def on_lock():
+        log("Screen LOCKED")
+        switch(MODE_LOCKED)
+
+    def on_unlock():
+        log("Screen UNLOCKED")
+        switch(MODE_UNLOCKED)
+
+    event_loop(on_lock, on_unlock)
+
+
+if __name__ == "__main__":
+    main()

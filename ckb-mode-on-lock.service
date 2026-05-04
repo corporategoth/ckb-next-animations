@@ -1,0 +1,84 @@
+# ckb-mode-on-lock.service -- systemd USER unit
+#
+# Copyright (c) 2026 Preston A. Elder <prez@neuromancy.net>.
+# Licensed under the MIT License -- see LICENSE in the project repository.
+#
+# Switches the active ckb-next mode (and optionally profile) when the
+# desktop session locks or unlocks. Cross-DE -- works with any DE that
+# emits org.freedesktop.ScreenSaver.ActiveChanged (KDE Plasma, XFCE,
+# Cinnamon, MATE) or org.gnome.ScreenSaver.ActiveChanged (GNOME).
+#
+# =============================================================================
+# Configuration
+# =============================================================================
+#
+# The companion script reads its config from three sources, in priority
+# order (highest first):
+#
+#   1. Environment variables, set here under [Service]:
+#        CKB_LOCK_MODE_UNLOCKED   ckb-next mode name to use on unlock
+#        CKB_LOCK_MODE_LOCKED     ckb-next mode name to use on lock
+#        CKB_LOCK_PROFILE         ckb-next profile name, or "none"
+#
+#   2. ~/.config/ckb-next/lock.conf  (recommended)
+#        See lock.conf.example in the repo for the format.
+#
+#   3. The defaults compiled into the script.
+#
+# So: usually you'd edit ~/.config/ckb-next/lock.conf and
+# leave this unit untouched. Add Environment= lines below only if you
+# want to override per-instance (e.g. a second copy of this unit).
+#
+# Values are passed verbatim to `ckb-next` as a `--mode <name>` /
+# `--profile <name>` argument, so they must match a mode/profile name
+# from your ckb-next-gui setup (case-sensitive).
+#
+# =============================================================================
+# Setup
+# =============================================================================
+#
+#   mkdir -p ~/.local/bin ~/.config/systemd/user
+#   cp ckb-mode-on-lock         ~/.local/bin/
+#   chmod +x                    ~/.local/bin/ckb-mode-on-lock
+#   cp ckb-mode-on-lock.service ~/.config/systemd/user/
+#   cp lock.conf.example        ~/.config/ckb-next/lock.conf
+#   $EDITOR                     ~/.config/ckb-next/lock.conf
+#
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now ckb-mode-on-lock.service
+#
+# Verify with:
+#   systemctl --user status ckb-mode-on-lock.service
+#   journalctl --user -u ckb-mode-on-lock.service -f
+#
+# =============================================================================
+# Requirements
+# =============================================================================
+#
+# - python3 (for the script)
+# - dbus-monitor (in the `dbus` / `dbus-tools` package)
+# - ckb-next-daemon running, so /dev/input/ckb*/cmd exists and is
+#   writable by your user
+
+[Unit]
+Description=Switch ckb-next mode on screen lock/unlock
+Documentation=https://github.com/ckb-next/ckb-next
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+
+# Optional per-unit overrides. Uncomment and edit if you want them to
+# win over ~/.config/ckb-next/lock.conf:
+#Environment=CKB_LOCK_MODE_UNLOCKED=EKG
+#Environment=CKB_LOCK_MODE_LOCKED=BrickBreaker
+#Environment=CKB_LOCK_PROFILE=none
+
+ExecStart=%h/.local/bin/ckb-mode-on-lock
+
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target

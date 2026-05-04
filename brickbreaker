@@ -1,0 +1,1672 @@
+#!/usr/bin/env python3
+"""
+brickbreaker - Native ckb-next animation (v5).
+
+A self-playing brick-breaker game with progressive levels, multi-hit bricks,
+power-up drops, and multi-ball.
+
+Copyright (c) 2026 Preston A. Elder <prez@neuromancy.net>.
+Licensed under the MIT License -- see the LICENSE file in the project
+repository for the full text.
+
+Designed and refined by Preston A. Elder <prez@neuromancy.net>.
+Code authored by Claude AI under Preston's direction.
+
+Tested on a Corsair K70. Other ckb-next-supported keyboards should work
+but key layouts may differ.
+
+Install:
+  Drop this file (executable) into your user-local ckb-next animations
+  directory, then have the GUI re-scan its scripts. No sudo, no daemon
+  restart, no GUI restart needed:
+
+    mkdir -p ~/.local/share/ckb-next/animations
+    cp brickbreaker ~/.local/share/ckb-next/animations/
+    chmod +x ~/.local/share/ckb-next/animations/brickbreaker
+
+  Then in ckb-next: Settings -> Animation Scripts -> Re-scan. The
+  animation appears in the Lighting tab as "Brick Breaker".
+
+  In the animation's Properties -> Settings -> Playback, enable
+  "Start with mode" so the animation runs whenever the mode is active.
+  Brick Breaker does NOT need "Start with key press" -- it does not
+  read keypresses.
+
+Numpad level counter:
+  * 1-9:  num1..num9 lit cumulatively in green (tier 0)
+  * 10-18: numlock lit + num1..num9 cumulating in yellow (tier 1)
+  * 19-27: numlock+numslash + num1..num9 cumulating in orange (tier 2)
+  * 28-36: numlock+numslash+numstar + num1..num9 in red (tier 3)
+  * 37+:  saturated red pulse
+
+Per-level scaling:
+  * Ball speed scales: base * (1 + level_speed * (level-1))
+  * Brick HP distribution shifts toward harder
+  * Paddle speed STAYS FIXED -- AI gets less accurate at high levels.
+
+Paddle physics (Arkanoid-style):
+  * Ball horizontal velocity comes from TWO sources at paddle collision:
+    1. Position contribution: where on paddle the ball hits (small effect)
+    2. Paddle friction: paddle's own horizontal motion drags the ball
+       (canonical formula: ball.vx += friction * paddle.vx)
+  * Result is capped so the ball always retains substantial upward motion.
+  * Speed bleeds back to base over ~3 seconds, so boosts don't accumulate.
+
+AI strategy:
+  * To deflect ball toward a target column, AI uses the SETUP-AND-GLIDE
+    technique: positions paddle to the OPPOSITE side of desired deflection
+    during setup phase, then slides through impact_x at impact time. The
+    paddle's motion-velocity gets imparted to the ball.
+  * AI naturally fails when ball is too fast for paddle to set up in time.
+
+AI skill (rolled per game):
+  * Each game restart rolls a new AI "player" with randomized skill from
+    Beta(3, 3). Most AIs are average; very-bad and very-good AIs are rare.
+  * Skill multipliers affect:
+      paddle_speed_mult (0.4x..3.0x): how fast the paddle can move
+      prediction_error_mult (5x..0.2x): how badly AI mispredicts the ball
+      aim_strength_mult (0.3x..1.0x): how aggressively AI tries to aim
+  * Result: each playthrough is a different character. Rare runs see a
+    terrible AI that loses on level 1, or a brilliant AI that clears all
+    36 levels.
+
+Multi-hit bricks (color by remaining HP):
+  hp=3 red, hp=2 yellow, hp=1 green.
+
+Power-up drops (rate-limited; ~one per 20-30s):
+  LONGER (green):       +1 paddle key
+  SHORTER (red):        -1 paddle key (AI avoids)
+  MULTIBALL (cyan):     +2 balls (cap 3)
+  EXTRA_LIFE (magenta): +1 life (cap 4, the max)
+
+Game flow:
+  Miss (last ball gone) -> red flash -> life lost.
+  0 lives -> red strobe -> reset to level 1.
+  All bricks cleared -> rainbow strobe -> next level.
+
+Parameters (all tunable in the ckb-next GUI):
+  basespeed       Base ball speed at level 1, keys/sec
+                  (default 60.0, range 20.0-200.0)
+  maxspeed        Cap on ball speed at level 1 after friction boosts
+                  (default 110.0, range 30.0-300.0)
+  paddlespeed     Paddle movement speed; fixed across all levels
+                  (default 110.0, range 20.0-300.0)
+  paddlewidth     Starting paddle width in keys, before power-ups
+                  (default 4, range 2-8)
+  levelspeed      Fractional speed boost added per level beyond 1
+                  (default 0.12, range 0.0-0.5; 0.12 = +12%/level)
+  chaos           Randomness applied to ball deflection
+                  (default 0.20, range 0.0-1.0)
+  aimstrength     How aggressively the AI aims its returns
+                  (default 0.50, range 0.0-1.0; further multiplied
+                  by the per-game rolled AI skill)
+  dropchance      Probability a destroyed brick drops a power-up
+                  (default 0.5, range 0.0-1.0; 0 disables drops)
+  dropcooldown    Minimum seconds between power-up drops
+                  (default 25.0, range 5.0-120.0)
+  paddlefriction  Fraction of paddle motion imparted to the ball
+                  on contact (default 0.6, range 0.0-1.0)
+  ballcolor       ARGB color of the ball (default ffffffff, white)
+  paddlecolor     ARGB color of the paddle (default ff00ffff, cyan)
+"""
+import sys
+import math
+import random
+
+
+# === Protocol helpers ======================================================
+
+def _need_encode(c):
+    o = ord(c)
+    return (o <= 0x2C or o == 0x2F or 0x3A <= o <= 0x40
+            or o == 0x5B or o == 0x5D or o >= 0x7F)
+
+
+def url_encode(s):
+    out = []
+    for c in s:
+        if _need_encode(c):
+            out.append("%{:02X}".format(ord(c)))
+        else:
+            out.append(c)
+    return "".join(out)
+
+
+def url_decode(s):
+    out, i = [], 0
+    while i < len(s):
+        if s[i] == "%" and i + 2 < len(s):
+            try:
+                out.append(chr(int(s[i + 1:i + 3], 16)))
+                i += 3
+                continue
+            except ValueError:
+                pass
+        out.append(s[i])
+        i += 1
+    return "".join(out)
+
+
+def read_words():
+    line = sys.stdin.readline()
+    if not line:
+        return ("", "", "")
+    parts = line.strip().split(None, 2)
+    while len(parts) < 3:
+        parts.append("")
+    return (url_decode(parts[0]), url_decode(parts[1]), url_decode(parts[2]))
+
+
+def emit(s): sys.stdout.write(s)
+def emit_line(s): sys.stdout.write(s + "\n")
+def flush(): sys.stdout.flush()
+
+
+# === Plugin info ===========================================================
+
+def ckb_info():
+    emit("guid "); emit(url_encode("{8B3A1F22-7C44-4E11-9F6A-1D4B5E7C2A91}")); emit_line("")
+    emit("name "); emit(url_encode("Brick Breaker")); emit_line("")
+    emit("version "); emit(url_encode("5.0")); emit_line("")
+    emit_line("year 2026")
+    emit("author "); emit(url_encode("Preston A. Elder <prez@neuromancy.net>")); emit_line("")
+    emit("license "); emit(url_encode("MIT")); emit_line("")
+    emit("description "); emit(url_encode(
+        "Self-playing brick-breaker with progressive levels, multi-hit "
+        "bricks, power-ups, and multi-ball. Numpad shows level.")); emit_line("")
+
+    emit("param double basespeed "); emit(url_encode("Base ball speed (lvl 1):"))
+    emit(" "); emit(url_encode("")); emit_line(" 60.0 20.0 200.0")
+    emit("param double maxspeed "); emit(url_encode("Max ball speed (lvl 1):"))
+    emit(" "); emit(url_encode("")); emit_line(" 110.0 30.0 300.0")
+    emit("param double paddlespeed "); emit(url_encode("Paddle speed (fixed):"))
+    emit(" "); emit(url_encode("")); emit_line(" 110.0 20.0 300.0")
+    emit("param long paddlewidth "); emit(url_encode("Starting paddle width:"))
+    emit(" "); emit(url_encode("keys")); emit_line(" 4 2 8")
+    emit("param double levelspeed "); emit(url_encode("Speed boost per level:"))
+    emit(" "); emit(url_encode("fraction")); emit_line(" 0.12 0.0 0.5")
+    emit("param double chaos "); emit(url_encode("Chaos:"))
+    emit(" "); emit(url_encode("")); emit_line(" 0.20 0.0 1.0")
+    emit("param double aimstrength "); emit(url_encode("AI aim strength:"))
+    emit(" "); emit(url_encode("")); emit_line(" 0.50 0.0 1.0")
+    emit("param double dropchance "); emit(url_encode("Drop chance per brick:"))
+    emit(" "); emit(url_encode("0=no drops")); emit_line(" 0.5 0.0 1.0")
+    emit("param double dropcooldown "); emit(url_encode("Drop cooldown:"))
+    emit(" "); emit(url_encode("seconds")); emit_line(" 25.0 5.0 120.0")
+    emit("param double paddlefriction "); emit(url_encode("Paddle friction:"))
+    emit(" "); emit(url_encode("")); emit_line(" 0.6 0.0 1.0")
+    emit("param argb ballcolor "); emit(url_encode("Ball color:"))
+    emit(" "); emit(url_encode("")); emit_line(" ffffffff")
+    emit("param argb paddlecolor "); emit(url_encode("Paddle color:"))
+    emit(" "); emit(url_encode("")); emit_line(" ff00ffff")
+
+    emit_line("kpmode name")
+    emit_line("time absolute")
+    emit_line("repeat off")
+    emit_line("preempt off")
+    emit_line("parammode live")
+
+    emit_line("preset Default basespeed=60.0 maxspeed=110.0 paddlespeed=110.0 "
+              "paddlewidth=4 levelspeed=0.12 chaos=0.20 aimstrength=0.50 "
+              "dropchance=0.5 dropcooldown=25.0 paddlefriction=0.6 "
+              "ballcolor=ffffffff paddlecolor=ff00ffff")
+    emit_line("preset Frantic basespeed=110.0 maxspeed=200.0 paddlespeed=180.0 "
+              "paddlewidth=3 levelspeed=0.18 chaos=0.40 aimstrength=0.40 "
+              "dropchance=0.7 dropcooldown=15.0 paddlefriction=0.7 "
+              "ballcolor=ffffffff paddlecolor=ffff00ff")
+    emit_line("preset Chill basespeed=35.0 maxspeed=60.0 paddlespeed=70.0 "
+              "paddlewidth=6 levelspeed=0.08 chaos=0.10 aimstrength=0.60 "
+              "dropchance=0.5 dropcooldown=25.0 paddlefriction=0.5 "
+              "ballcolor=ffffffaa paddlecolor=ff00ffaa")
+    flush()
+
+
+# === Constants =============================================================
+
+NAV_AND_MEDIA_KEYS = frozenset({
+    "prtscn", "scroll", "pause",
+    "ins", "home", "pgup", "del", "end", "pgdn",
+    "up", "down", "left", "right",
+    "stop", "prev", "play", "next",
+    "mute", "volup", "voldn",
+    "light", "lock",
+})
+
+LIVES_PREFERENCES = (
+    ("stop", "prev", "play", "next"),
+    ("mute", "volup", "voldn", "lock"),
+)
+MAX_LIVES = 4
+
+# Numpad level counter keys
+NUMPAD_NUMBER_KEYS = ["num1", "num2", "num3", "num4", "num5",
+                      "num6", "num7", "num8", "num9"]
+NUMPAD_TIER_KEYS = ["numlock", "numslash", "numstar", "numminus"]
+
+TIER_COLORS = [
+    (40, 230, 60),     # tier 0 (lvl 1-9):   green
+    (240, 220, 30),    # tier 1 (lvl 10-18): yellow
+    (240, 130, 30),    # tier 2 (lvl 19-27): orange
+    (240, 50, 30),     # tier 3 (lvl 28-36): red
+]
+
+HP_COLORS = {
+    1: (40, 220, 60),
+    2: (240, 200, 30),
+    3: (240, 60, 30),
+}
+
+DROP_LONGER = 0
+DROP_SHORTER = 1
+DROP_MULTIBALL = 2
+DROP_EXTRA_LIFE = 3
+DROP_COLORS = {
+    DROP_LONGER:     (40, 230, 60),     # green
+    DROP_SHORTER:    (240, 50, 30),     # red
+    DROP_MULTIBALL:  (40, 200, 240),    # cyan
+    DROP_EXTRA_LIFE: (240, 100, 240),   # magenta/pink
+}
+DROP_FALL_SPEED = 35.0
+
+PHASE_PLAY = 0
+PHASE_MISS_FLASH = 1
+PHASE_GAME_OVER = 2
+PHASE_LEVEL_UP = 3
+
+
+# 5x4 bitmap letters for the GAME OVER text. '#' = lit, '.' = off.
+# These render in the main typing body using 5 rows (the F-row plus the
+# main typing area) and 4 columns. The F-row has gaps at esc/f1, f4/f5,
+# f8/f9, so we use the contiguous group f5..f8 to avoid visible breaks
+# inside letters.
+#   row 0 -> F-row    cols f5..f8
+#   row 1 -> number   cols 6..9
+#   row 2 -> qwerty   cols y..o
+#   row 3 -> home     cols h..l
+#   row 4 -> zxcv     cols n..dot
+LETTERS = {
+    'G': ('.###',
+          '#...',
+          '#.##',
+          '#...',
+          '.###'),
+    'A': ('.##.',
+          '#..#',
+          '####',
+          '#..#',
+          '#..#'),
+    'M': ('#..#',
+          '####',
+          '####',
+          '#..#',
+          '#..#'),
+    'E': ('####',
+          '#...',
+          '###.',
+          '#...',
+          '####'),
+    'O': ('.##.',
+          '#..#',
+          '#..#',
+          '#..#',
+          '.##.'),
+    'V': ('#..#',
+          '#..#',
+          '.##.',
+          '..#.',
+          '..#.'),
+    'R': ('###.',
+          '#..#',
+          '###.',
+          '#.#.',
+          '#..#'),
+}
+# Keys used to render letters (cols 0..3 = leftmost..rightmost).
+# F-row group f5..f8 aligns most cleanly with rows below (~11 units total
+# slant from F-row to zxcv -- staggered keyboard reality).
+TEXT_F_KEYS      = ('f5', 'f6', 'f7', 'f8')
+TEXT_NUMBER_KEYS = ('6', '7', '8', '9')
+TEXT_QWERTY_KEYS = ('y', 'u', 'i', 'o')
+TEXT_HOME_KEYS   = ('h', 'j', 'k', 'l')
+TEXT_ZXCV_KEYS   = ('n', 'm', 'comma', 'dot')
+
+
+def is_main_section(name):
+    if name in NAV_AND_MEDIA_KEYS:
+        return False
+    if name.startswith("num"):
+        return False
+    return True
+
+
+# === Layout helpers ========================================================
+
+class Key:
+    __slots__ = ("name", "x", "y", "a", "r", "g", "b")
+
+    def __init__(self, name, x, y):
+        self.name = name
+        self.x, self.y = x, y
+        self.a = self.r = self.g = self.b = 0
+
+
+def find_row_y(keys, anchor_names):
+    for k in keys:
+        if k.name in anchor_names:
+            return k.y
+    return None
+
+
+# === Game entities =========================================================
+
+class Brick:
+    __slots__ = ("key_idx", "x", "y", "hp", "max_hp")
+
+    def __init__(self, key_idx, x, y, hp):
+        self.key_idx = key_idx
+        self.x = x
+        self.y = y
+        self.hp = hp
+        self.max_hp = hp
+
+
+class Ball:
+    __slots__ = ("x", "y", "vx", "vy", "alive", "descent_count",
+                 "bounces_since_brick")
+
+    def __init__(self, x, y, vx, vy):
+        self.x = x
+        self.y = y
+        self.vx = vx
+        self.vy = vy
+        self.alive = True
+        # Increments each time the ball transitions from going up to going
+        # down. Used by the AI to re-roll its prediction error at the start
+        # of each new descent (simulates human "commit to a prediction").
+        self.descent_count = 1 if vy > 0 else 0
+        # Counts paddle bounces with no intervening brick hit. If this gets
+        # too high the ball is stuck in a loop (e.g. bouncing vertically
+        # in a column where the brick has been destroyed) and we apply a
+        # random angle perturbation to shake it loose.
+        self.bounces_since_brick = 0
+
+
+class Drop:
+    __slots__ = ("x", "y", "kind", "alive")
+
+    def __init__(self, x, y, kind):
+        self.x = x
+        self.y = y
+        self.kind = kind
+        self.alive = True
+
+
+# === Game ==================================================================
+
+class Game:
+    def __init__(self):
+        self.keys = []
+        self.keys_by_name = {}
+
+        # Layout (computed at init)
+        self.brick_y_top = None
+        self.brick_y_bot = None
+        self.paddle_y = None
+        self.x_min = 0.0
+        self.x_max = 0.0
+        self.brick_radius = 7.0   # Slight overlap (>half-spacing) closes corner gaps
+        self.row_step = 12.0
+        self.paddle_unit = 12.0
+        self.lives_key_indices = []
+        self.numpad_number_indices = []
+        self.numpad_tier_indices = []
+        self.brick_indices_initial = []
+        self.paddle_row_xs = []
+
+        # Game state
+        self.lives = MAX_LIVES
+        self.level = 1
+        self.phase = PHASE_PLAY
+        self.phase_t = 0.0
+        self.bricks = []
+        self.balls = []
+        self.drops = []
+        self.paddle_x = 0.0
+        self.paddle_velocity_x = 0.0   # tracked frame-to-frame for paddle friction
+        self.paddle_keys_count = 4
+        self.next_drop_t = 5.0
+        self.t = 0.0
+        self.flash = {}
+        self.rainbow_phase = 0.0
+
+        # AI prediction error -- represents human-style "I committed to a
+        # prediction and it was slightly wrong". Refreshed at the start of
+        # each ball descent.
+        self._aim_error_x = 0.0
+        self._last_descend_id = -1   # tracks "fresh descent" events
+
+        # AI skill: each game restart rolls a new "player" with randomized
+        # skill stats. Drawn from Beta(3,3) -- centered around 0.5 with
+        # extremes (great or terrible AI) being rare. See _roll_ai_skill.
+        self._ai_skill = 0.5
+        self._paddle_speed_mult = 1.0
+        self._prediction_error_mult = 1.0
+        self._aim_strength_mult = 1.0
+
+        # Parameters
+        self.base_speed = 60.0
+        self.max_speed = 110.0
+        self.paddle_speed = 110.0
+        self.starting_paddle_width = 4
+        self.level_speed = 0.12
+        self.chaos = 0.20
+        self.aim_strength = 0.50
+        self.drop_chance = 0.5
+        self.drop_cooldown = 25.0
+        self.paddle_friction = 0.6   # how much paddle motion imparts to ball (0..1)
+        self.ball_argb = (255, 255, 255, 255)
+        self.paddle_argb = (255, 0, 255, 255)
+        # Track if paddle width was explicitly user-set so we don't override
+        self._user_set_width = False
+
+    def init(self):
+        if not self.keys:
+            return
+        self.keys_by_name = {k.name: i for i, k in enumerate(self.keys)}
+
+        self.brick_y_top = find_row_y(self.keys, ("f1", "esc"))
+        self.brick_y_bot = find_row_y(self.keys, ("1", "grave"))
+        self.paddle_y = find_row_y(self.keys, ("z", "lshift"))
+
+        if self.brick_y_top is None or self.brick_y_bot is None or self.paddle_y is None:
+            ys = sorted({k.y for k in self.keys if is_main_section(k.name)})
+            if self.brick_y_top is None and ys:
+                self.brick_y_top = ys[0]
+            if self.brick_y_bot is None and len(ys) >= 2:
+                self.brick_y_bot = ys[1]
+            if self.paddle_y is None and len(ys) >= 2:
+                self.paddle_y = ys[-2]
+
+        self.brick_indices_initial = []
+        for i, k in enumerate(self.keys):
+            if not is_main_section(k.name):
+                continue
+            if k.y == self.brick_y_top or k.y == self.brick_y_bot:
+                self.brick_indices_initial.append(i)
+
+        playfield_keys = [k for k in self.keys
+                          if is_main_section(k.name)
+                          and k.y in (self.brick_y_top, self.brick_y_bot,
+                                      self.paddle_y)]
+        if playfield_keys:
+            self.x_min = float(min(k.x for k in playfield_keys))
+            self.x_max = float(max(k.x for k in playfield_keys))
+        else:
+            self.x_min = 0.0
+            self.x_max = 168.0
+
+        paddle_row_keys = [k for k in self.keys
+                           if k.y == self.paddle_y and is_main_section(k.name)]
+        self.paddle_row_xs = sorted({k.x for k in paddle_row_keys})
+
+        if len(self.paddle_row_xs) >= 2:
+            gaps = [self.paddle_row_xs[i+1] - self.paddle_row_xs[i]
+                    for i in range(len(self.paddle_row_xs) - 1)]
+            gaps = [g for g in gaps if 8 <= g <= 18]
+            self.paddle_unit = (sum(gaps) / len(gaps)) if gaps else 12.0
+        else:
+            self.paddle_unit = 12.0
+        self.brick_radius = self.paddle_unit * 0.65
+
+        if (self.brick_y_top is not None and self.brick_y_bot is not None
+                and self.brick_y_bot != self.brick_y_top):
+            self.row_step = abs(self.brick_y_bot - self.brick_y_top)
+        else:
+            self.row_step = 12.0
+
+        self.lives_key_indices = self._find_lives_keys()
+
+        self.numpad_number_indices = []
+        for n in NUMPAD_NUMBER_KEYS:
+            i = self.keys_by_name.get(n)
+            if i is not None:
+                self.numpad_number_indices.append(i)
+        self.numpad_tier_indices = []
+        for n in NUMPAD_TIER_KEYS:
+            i = self.keys_by_name.get(n)
+            if i is not None:
+                self.numpad_tier_indices.append(i)
+
+        self._reset_match(full=True)
+
+    def _find_lives_keys(self):
+        for names in LIVES_PREFERENCES:
+            indices = [self.keys_by_name[n] for n in names
+                       if n in self.keys_by_name]
+            if len(indices) == len(names):
+                return indices
+        return []
+
+    def _generate_bricks(self):
+        L = self.level
+        if L <= 1:
+            weights = [1.0, 0.0, 0.0]
+        elif L == 2:
+            weights = [0.7, 0.3, 0.0]
+        elif L == 3:
+            weights = [0.5, 0.5, 0.0]
+        elif L == 4:
+            weights = [0.4, 0.5, 0.1]
+        elif L == 5:
+            weights = [0.3, 0.5, 0.2]
+        elif L == 6:
+            weights = [0.2, 0.5, 0.3]
+        elif L == 7:
+            weights = [0.1, 0.4, 0.5]
+        else:
+            weights = [0.0, 0.3, 0.7]
+
+        self.bricks = []
+        for idx in self.brick_indices_initial:
+            k = self.keys[idx]
+            r = random.random()
+            if r < weights[0]:
+                hp = 1
+            elif r < weights[0] + weights[1]:
+                hp = 2
+            else:
+                hp = 3
+            self.bricks.append(Brick(idx, float(k.x), float(k.y), hp))
+
+    def _reset_match(self, full=False):
+        if full:
+            self.lives = MAX_LIVES
+            self.level = 1
+            # New game = new AI "player". Each playthrough is a different
+            # character with rolled skill stats.
+            self._roll_ai_skill()
+        # Power-ups don't persist between levels. Paddle width resets to
+        # starting size every level. (Multiball naturally resets because
+        # _launch_balls below creates a single ball.)
+        self.paddle_keys_count = self.starting_paddle_width
+        self._generate_bricks()
+        self.drops = []
+        self.next_drop_t = self.t + max(5.0, self.drop_cooldown * 0.3)
+        self._launch_balls()
+
+    def _launch_balls(self):
+        center = (self.x_min + self.x_max) / 2.0
+        half = (self.x_max - self.x_min) / 2.0
+        ball_x = center + random.uniform(-0.3, 0.3) * half
+        if self.brick_y_bot is not None and self.paddle_y is not None:
+            ball_y = (self.brick_y_bot + self.paddle_y) / 2.0
+        else:
+            ball_y = 30.0
+        ang = math.radians(random.uniform(35, 70))
+        sign = 1 if random.random() < 0.5 else -1
+        speed = self._level_base_speed()
+        vx = math.cos(ang) * speed * sign
+        vy = math.sin(ang) * speed
+        self.balls = [Ball(ball_x, ball_y, vx, vy)]
+        pw = self._paddle_width_units()
+        self.paddle_x = (self.x_min + self.x_max) / 2.0 - pw / 2.0
+        self._clamp_paddle()
+
+    def _level_base_speed(self):
+        return self.base_speed * (1.0 + self.level_speed * (self.level - 1))
+
+    def _level_max_speed(self):
+        return self.max_speed * (1.0 + self.level_speed * (self.level - 1))
+
+    def _paddle_width_units(self):
+        return self.paddle_unit * self.paddle_keys_count
+
+    def _clamp_paddle(self):
+        pw = self._paddle_width_units()
+        if pw > self.x_max - self.x_min:
+            self.paddle_x = self.x_min
+        else:
+            self.paddle_x = max(self.x_min,
+                                min(self.x_max - pw, self.paddle_x))
+
+    def _paddle_lit_xs(self):
+        pl = self.paddle_x
+        pr = self.paddle_x + self._paddle_width_units()
+        return [x for x in self.paddle_row_xs if pl <= x <= pr]
+
+    def _paddle_hit_range(self):
+        """Hit range matches visually-lit paddle keys exactly.
+
+        EXCEPT at the playfield edges: if the paddle is pressed against the
+        left or right wall, extend the hit range to the wall. The K70 (and
+        many keyboards) has asymmetric rows -- the paddle row may not
+        extend as far as the brick rows or top of playfield, leaving a
+        small "dead zone" near the wall. We extend the hit zone there so
+        balls that arrive in the corner are still catchable when the paddle
+        is positioned at the wall.
+        """
+        lit = self._paddle_lit_xs()
+        if not lit:
+            return None
+        half = self.paddle_unit / 2.0
+        lo = lit[0] - half
+        hi = lit[-1] + half
+        # Edge expansion
+        if self.paddle_x <= self.x_min + 0.5:
+            lo = self.x_min - half
+        if self.paddle_x + self._paddle_width_units() >= self.x_max - 0.5:
+            hi = self.x_max + half
+        return lo, hi
+
+    def set_param(self, name, value):
+        try:
+            if name == "basespeed":
+                self.base_speed = max(5.0, float(value))
+            elif name == "maxspeed":
+                self.max_speed = max(self.base_speed, float(value))
+            elif name == "paddlespeed":
+                self.paddle_speed = max(5.0, float(value))
+            elif name == "paddlewidth":
+                v = max(2, min(8, int(value)))
+                self.starting_paddle_width = v
+                if not self._user_set_width:
+                    self.paddle_keys_count = v
+                self._user_set_width = True
+            elif name == "levelspeed":
+                self.level_speed = max(0.0, float(value))
+            elif name == "chaos":
+                self.chaos = max(0.0, min(1.0, float(value)))
+            elif name == "aimstrength":
+                self.aim_strength = max(0.0, min(1.0, float(value)))
+            elif name == "dropchance":
+                self.drop_chance = max(0.0, min(1.0, float(value)))
+            elif name == "dropcooldown":
+                self.drop_cooldown = max(1.0, float(value))
+            elif name == "paddlefriction":
+                self.paddle_friction = max(0.0, min(1.0, float(value)))
+            elif name == "ballcolor":
+                self.ball_argb = _parse_argb(value)
+            elif name == "paddlecolor":
+                self.paddle_argb = _parse_argb(value)
+        except (ValueError, TypeError):
+            pass
+
+    def keypress(self, name, down):
+        if not down:
+            return
+        i = self.keys_by_name.get(name)
+        if i is not None:
+            self.flash[i] = 0.4
+
+    def advance(self, dt):
+        if dt <= 0:
+            return
+        self.t += dt
+        self.phase_t += dt
+        self.rainbow_phase = (self.rainbow_phase + dt * 1.5) % 1.0
+
+        for i in list(self.flash.keys()):
+            self.flash[i] -= dt
+            if self.flash[i] <= 0:
+                del self.flash[i]
+
+        if self.phase == PHASE_MISS_FLASH:
+            if self.phase_t >= 0.6:
+                # Power-ups don't survive a life loss either: paddle width
+                # resets to starting size, balls relaunch as a single ball.
+                self.paddle_keys_count = self.starting_paddle_width
+                self._enter_phase(PHASE_PLAY)
+                self._launch_balls()
+            return
+        if self.phase == PHASE_GAME_OVER:
+            # Game over phase: writes "GAME" then "OVER" letter-by-letter,
+            # then a brief red strobe, then resets.
+            #   0.0 - 2.0s : GAME (4 letters at 0.5s each)
+            #   2.0 - 2.4s : brief gap between words
+            #   2.4 - 4.4s : OVER (4 letters at 0.5s each)
+            #   4.4 - 4.9s : red strobe
+            if self.phase_t >= 4.9:
+                self._enter_phase(PHASE_PLAY)
+                self._reset_match(full=True)
+            return
+        if self.phase == PHASE_LEVEL_UP:
+            if self.phase_t >= 1.5:
+                self.level += 1
+                try:
+                    sys.stderr.write(
+                        f"[brickbreaker] level up -> {self.level} "
+                        f"(skill={self._ai_skill:.2f})\n")
+                    sys.stderr.flush()
+                except Exception:
+                    pass
+                self._enter_phase(PHASE_PLAY)
+                # full=False: keep lives, advance to next level. _reset_match
+                # also resets paddle width and balls (no power-up persistence).
+                self._reset_match(full=False)
+            return
+
+        # Drops fall
+        for d in self.drops:
+            if d.alive:
+                d.y += DROP_FALL_SPEED * dt
+
+        # Bleed ball speed back toward base (3-second time constant).
+        # This decays speed boosts from edge hits and paddle friction over time,
+        # so ball doesn't stay pegged at max speed forever.
+        self._bleed_speed_toward_base(dt)
+
+        # Move paddle (and track velocity for paddle-friction physics).
+        # Effective paddle speed includes the AI-skill multiplier so a
+        # bad AI is sluggish, a top-tier AI is lightning fast.
+        prev_paddle_x = self.paddle_x
+        target = self._predict_paddle_target_with_drops()
+        center = self.paddle_x + self._paddle_width_units() / 2.0
+        eff_paddle_speed = self.paddle_speed * self._paddle_speed_mult
+        max_step = eff_paddle_speed * dt
+        delta = target - center
+        if abs(delta) <= max_step:
+            self.paddle_x += delta
+        else:
+            self.paddle_x += math.copysign(max_step, delta)
+        self._clamp_paddle()
+        # Compute current paddle velocity (used by ball-paddle collision below)
+        if dt > 0:
+            self.paddle_velocity_x = (self.paddle_x - prev_paddle_x) / dt
+        else:
+            self.paddle_velocity_x = 0.0
+
+        # Sub-stepped physics
+        max_speed_now = max(self._level_max_speed(),
+                            max((math.hypot(b.vx, b.vy) for b in self.balls),
+                                default=0))
+        substep = max(0.005, min(0.02,
+                                 self.brick_radius / max(1.0, max_speed_now) * 0.4))
+        remaining = dt
+        while remaining > 0:
+            step = min(substep, remaining)
+            self._integrate_substep(step)
+            remaining -= step
+            if self.phase != PHASE_PLAY:
+                break
+
+        # Process drops at paddle row
+        if self.paddle_y is not None:
+            hit_range = self._paddle_hit_range()
+            for d in self.drops:
+                if not d.alive:
+                    continue
+                if d.y >= self.paddle_y:
+                    if hit_range is not None and hit_range[0] <= d.x <= hit_range[1]:
+                        self._apply_drop(d.kind)
+                    d.alive = False
+        self.drops = [d for d in self.drops
+                      if d.alive
+                      and (self.paddle_y is None or d.y < self.paddle_y + self.row_step)]
+
+    def _roll_ai_skill(self):
+        """Roll a new AI 'player' with randomized skill stats.
+
+        Each game restart produces a new AI character. Most AIs are
+        average; very-bad and very-good AIs are rare. The skill stat is
+        drawn from Beta(3, 3), which is symmetric and peaked near 0.5.
+
+        Distribution:
+          ~3% of AIs have skill < 0.15 (terrible -- often die on level 1)
+          ~50% have skill in [0.35, 0.65] (typical -- clear a few levels)
+          ~3% have skill > 0.85 (excellent -- may clear all 36 levels)
+
+        Skill stat maps to multipliers applied to user-settable params:
+          paddle_speed_mult: 0.4x .. 3.0x -- terrible AI can barely move,
+              top-tier AI has paddle so fast it can track any ball
+          prediction_error_mult: 5x .. 0.2x -- terrible AI mispredicts
+              the ball by paddle-widths, top-tier AI is laser-accurate
+          aim_strength_mult: 0.3x .. 1.0x -- terrible AI barely aims
+              (mostly just blocks), top-tier AI uses full aim
+        """
+        skill = random.betavariate(3.0, 3.0)
+        self._ai_skill = skill
+        self._paddle_speed_mult = 0.4 + skill * 2.6
+        self._prediction_error_mult = 5.0 - skill * 4.8
+        self._aim_strength_mult = 0.3 + skill * 0.7
+        # Log to stderr (visible in daemon log if debug enabled) and to
+        # the debug file. Helps gauge whether each restart is actually
+        # rolling distinct stats.
+        try:
+            sys.stderr.write(
+                f"[brickbreaker] rolled AI: skill={skill:.3f} "
+                f"paddle_speed_mult={self._paddle_speed_mult:.2f} "
+                f"pred_error_mult={self._prediction_error_mult:.2f} "
+                f"aim_mult={self._aim_strength_mult:.2f}\n")
+            sys.stderr.flush()
+        except Exception:
+            pass
+
+    def _enter_phase(self, phase):
+        self.phase = phase
+        self.phase_t = 0.0
+
+    def _bleed_speed_toward_base(self, dt):
+        """Gradually relax ball speed toward level base speed.
+
+        Speed boosts from edge hits and paddle friction decay over a
+        ~3-second time constant. Without this, balls stay at max speed
+        indefinitely after a series of edge hits.
+        """
+        base = self._level_base_speed()
+        rate = 1.0 - math.exp(-dt / 3.0)
+        for ball in self.balls:
+            if not ball.alive:
+                continue
+            cur = math.hypot(ball.vx, ball.vy)
+            if cur <= 0:
+                continue
+            new_speed = cur + (base - cur) * rate
+            # Don't bleed BELOW base, just toward it from above
+            if cur > base:
+                new_speed = max(base, new_speed)
+            scale = new_speed / cur
+            ball.vx *= scale
+            ball.vy *= scale
+
+    def _apply_drop(self, kind):
+        if kind == DROP_LONGER:
+            self.paddle_keys_count = min(6, self.paddle_keys_count + 1)
+            self._clamp_paddle()
+        elif kind == DROP_SHORTER:
+            self.paddle_keys_count = max(2, self.paddle_keys_count - 1)
+            self._clamp_paddle()
+        elif kind == DROP_MULTIBALL:
+            if len(self.balls) < 3:
+                anchor = max(self.balls, key=lambda b: b.y)
+                base_speed = math.hypot(anchor.vx, anchor.vy) or self._level_base_speed()
+                base_angle = math.atan2(anchor.vy, anchor.vx)
+                for da in (math.radians(30), math.radians(-30)):
+                    if len(self.balls) >= 3:
+                        break
+                    ang = base_angle + da
+                    self.balls.append(Ball(
+                        anchor.x, anchor.y,
+                        math.cos(ang) * base_speed,
+                        math.sin(ang) * base_speed,
+                    ))
+        elif kind == DROP_EXTRA_LIFE:
+            self.lives = min(MAX_LIVES, self.lives + 1)
+
+    def _bricks_target_x(self, ball_x=None):
+        """Pick a target brick column to aim the ball toward.
+
+        Strategy:
+          1. Prefer the column with the MOST REMAINING TOTAL HP (multi-hit
+             bricks count more than 1-hit bricks).
+          2. On ties, pick a column that requires MEANINGFUL DEFLECTION
+             from current ball position -- specifically, the column at the
+             MEDIAN distance from the ball among the tied candidates.
+             This makes the AI use paddle velocity to direct the ball,
+             rather than just blocking it straight back up.
+
+        The previous "closest column" tie-breaker caused the AI to pick a
+        target right above the ball, requiring no deflection. The paddle
+        would just block the ball, sending it straight back up. This
+        version forces the AI to actively redirect the ball to under-
+        attacked columns.
+        """
+        if not self.bricks:
+            return None
+        col_total_hp = {}
+        for b in self.bricks:
+            if b.hp <= 0:
+                continue
+            col_total_hp[b.x] = col_total_hp.get(b.x, 0) + b.hp
+        if not col_total_hp:
+            return None
+        max_hp = max(col_total_hp.values())
+        candidates = sorted([x for x, hp in col_total_hp.items()
+                             if hp == max_hp])
+        if len(candidates) == 1:
+            return candidates[0]
+        # Multiple columns with max HP -- pick the one that requires
+        # meaningful but reachable deflection
+        ref_x = ball_x if ball_x is not None else (
+            self.paddle_x + self._paddle_width_units() / 2.0)
+        # Sort by distance from ball, pick the MEDIAN (avoids extremes:
+        # too close = no deflection, too far = impossible to aim)
+        by_dist = sorted(candidates, key=lambda x: abs(x - ref_x))
+        return by_dist[len(by_dist) // 2]
+
+    def _predict_impact_x(self, ball):
+        if ball.vy <= 0:
+            return ball.x
+        x, y, vx, vy = ball.x, ball.y, ball.vx, ball.vy
+        py = self.paddle_y if self.paddle_y is not None else self.x_max
+        for _ in range(100):
+            if y >= py:
+                break
+            t_paddle = (py - y) / vy if vy > 0 else 1e9
+            if vx > 0:
+                t_wall = (self.x_max - x) / vx
+            elif vx < 0:
+                t_wall = (self.x_min - x) / vx
+            else:
+                t_wall = 1e9
+            t = min(t_paddle, t_wall)
+            x += vx * t
+            y += vy * t
+            if t == t_paddle:
+                break
+            vx = -vx
+        return x
+
+    def _predict_paddle_target_with_drops(self):
+        """Plan paddle position to (a) catch the ball and (b) optionally
+        impart lateral momentum toward a target brick column.
+
+        AI strategy: a paddle moving laterally at impact imparts momentum
+        to the ball (paddle friction). To deflect the ball rightward, the
+        AI positions paddle to the LEFT of impact during setup, then slides
+        right toward impact_x at impact time. The paddle's motion-velocity
+        gets transferred to the ball.
+
+        Phases:
+          - Setup (impact_t > glide_time): aim for setup_x (offset to the
+            opposite side of desired deflection). Paddle parks here.
+          - Glide (impact_t <= glide_time): aim for impact_x. Paddle slides
+            from setup_x to impact_x at max speed, gaining velocity in
+            the desired direction.
+          - At impact: paddle is at impact_x (ball hits paddle ~center)
+            but moving fast in desired direction.
+
+        AI can't always succeed — if ball is too fast, paddle can't reach
+        setup_x in time, or the glide window is too short. In those cases
+        the AI degrades gracefully to "just catch the ball at impact_x"
+        with no lateral aim.
+        """
+        descending_balls = [b for b in self.balls if b.vy > 0]
+        if descending_balls:
+            primary_ball = min(
+                descending_balls,
+                key=lambda b: (self.paddle_y - b.y) / b.vy
+                if (self.paddle_y is not None and b.vy > 0) else 1e9)
+        elif self.balls:
+            primary_ball = self.balls[0]
+        else:
+            return self.paddle_x + self._paddle_width_units() / 2.0
+
+        impact_x = self._predict_impact_x(primary_ball)
+        impact_t = ((self.paddle_y - primary_ball.y) / max(1e-6, primary_ball.vy)
+                    if (primary_ball.vy > 0 and self.paddle_y is not None)
+                    else 1e9)
+
+        # Human-style prediction error: AI commits to a (possibly wrong)
+        # impact_x at the START of each descent, sticks with it until ball
+        # changes direction. Magnitude scales with chaos, level, and the
+        # rolled AI skill. A top-tier AI has tiny errors (skill mult 0.2x);
+        # a terrible AI mispredicts by paddle-widths (skill mult 5x).
+        if primary_ball.descent_count != self._last_descend_id:
+            self._last_descend_id = primary_ball.descent_count
+            base_error = self.chaos * (15 + self.level * 1.5)
+            error_std = base_error * self._prediction_error_mult
+            self._aim_error_x = random.gauss(0, error_std * 0.5)
+            self._aim_error_x = max(-error_std, min(error_std, self._aim_error_x))
+        impact_x_with_error = impact_x + self._aim_error_x
+
+        target_brick_x = self._bricks_target_x(ball_x=primary_ball.x)
+        pw = self._paddle_width_units()
+        half_pw = pw / 2.0
+
+        # --- Determine setup offset based on aim ---
+        # Effective aim strength includes the AI-skill multiplier. A
+        # terrible AI has aim_mult=0.3 (mostly just blocks); a top-tier
+        # AI has aim_mult=1.0 (full aim).
+        eff_aim_strength = self.aim_strength * self._aim_strength_mult
+        if target_brick_x is None or eff_aim_strength <= 0:
+            setup_offset = 0.0
+        else:
+            delta = target_brick_x - impact_x_with_error
+            kb_half = (self.x_max - self.x_min) / 2.0 or 1.0
+            # Magnitude of aim, scaled by aim_strength
+            aim_magnitude = min(1.0, abs(delta) / (kb_half * 0.4))
+            aim_magnitude *= eff_aim_strength
+            # setup_offset is OPPOSITE direction from desired deflection.
+            # If we want ball to go RIGHT (delta > 0), paddle sets up to
+            # the LEFT (setup_offset < 0), then slides right at impact.
+            sign = -1.0 if delta > 0 else (1.0 if delta < 0 else 0.0)
+            setup_offset = sign * pw * 0.6 * aim_magnitude
+
+        # --- Phase decision: setup or glide? ---
+        # Time for paddle to traverse setup_offset at effective max speed
+        eff_paddle_speed = self.paddle_speed * self._paddle_speed_mult
+        if setup_offset != 0.0:
+            travel_dist = abs(setup_offset)
+            travel_time = travel_dist / max(1.0, eff_paddle_speed)
+        else:
+            travel_time = 0.0
+
+        # A small margin so paddle arrives just in time, not early
+        glide_threshold = travel_time + 0.05
+
+        if impact_t > glide_threshold:
+            # Setup phase: park at setup position
+            target = impact_x_with_error + setup_offset
+        else:
+            # Glide phase: paddle slides toward impact_x at max speed,
+            # gaining velocity in desired direction
+            target = impact_x_with_error
+
+        # --- Drop adjustments ---
+        if self.paddle_y is not None and self.drops:
+            ball_t = impact_t
+            for d in self.drops:
+                if not d.alive:
+                    continue
+                if d.y >= self.paddle_y:
+                    continue
+                drop_t = (self.paddle_y - d.y) / DROP_FALL_SPEED
+                if drop_t > ball_t + 0.2:
+                    continue
+                drop_dist = d.x - impact_x
+                if abs(drop_dist) > half_pw * 1.5:
+                    continue
+                if d.kind == DROP_SHORTER:
+                    if abs(drop_dist) < half_pw * 0.7:
+                        nudge_dir = 1.0 if drop_dist < 0 else -1.0
+                        target += nudge_dir * half_pw * 0.4
+                else:
+                    nudge_amount = drop_dist * 0.4
+                    nudge_amount = max(-half_pw * 0.5,
+                                       min(half_pw * 0.5, nudge_amount))
+                    target += nudge_amount
+        return target
+
+    def _integrate_substep(self, dt):
+        for ball in self.balls:
+            if not ball.alive:
+                continue
+            self._integrate_ball(ball, dt)
+
+        self.balls = [b for b in self.balls if b.alive]
+
+        if not self.balls:
+            self.lives -= 1
+            self._enter_phase(PHASE_MISS_FLASH)
+            if self.lives <= 0:
+                self._enter_phase(PHASE_GAME_OVER)
+            return
+
+        if not any(b.hp > 0 for b in self.bricks):
+            self._enter_phase(PHASE_LEVEL_UP)
+
+    def _integrate_ball(self, ball, dt):
+        prev_going_up = ball.vy < 0
+        nx = ball.x + ball.vx * dt
+        ny = ball.y + ball.vy * dt
+
+        # Side walls
+        if nx < self.x_min:
+            nx = self.x_min + (self.x_min - nx)
+            ball.vx = abs(ball.vx)
+        elif nx > self.x_max:
+            nx = self.x_max - (nx - self.x_max)
+            ball.vx = -abs(ball.vx)
+
+        # Top wall
+        if self.brick_y_top is not None:
+            top_y = self.brick_y_top - self.row_step * 0.5
+            if ny < top_y:
+                ny = top_y + (top_y - ny)
+                ball.vy = abs(ball.vy)
+
+        # Brick collision -- mirror the ball renderer's "closest main-
+        # section key" logic so the physics matches what the user sees.
+        # If the ball's closest key (excluding paddle row) is an alive
+        # brick, that brick is hit. Without mirroring renderer logic, the
+        # ball can appear on a brick without destroying it (e.g. ball at
+        # dy=7 from F-row brick: a strict-< AABB check fails but the ball
+        # still renders on that brick because it's the closest key).
+        closest_key_idx = None
+        closest_d = 1e9
+        for k_i, k in enumerate(self.keys):
+            if not is_main_section(k.name):
+                continue
+            if k.y >= self.paddle_y:
+                continue
+            d = math.hypot(nx - k.x, ny - k.y)
+            if d < closest_d:
+                closest_d = d
+                closest_key_idx = k_i
+        best = None
+        if closest_key_idx is not None:
+            for brick in self.bricks:
+                if brick.hp > 0 and brick.key_idx == closest_key_idx:
+                    best = brick
+                    break
+        if best is not None:
+            dx, dy = nx - best.x, ny - best.y
+            if abs(dx) > abs(dy):
+                ball.vx = math.copysign(abs(ball.vx), dx if dx != 0 else 1.0)
+                nx = best.x + math.copysign(self.brick_radius, ball.vx)
+            else:
+                ball.vy = math.copysign(abs(ball.vy), dy if dy != 0 else 1.0)
+                ny = best.y + math.copysign(self.brick_radius, ball.vy)
+            best.hp -= 1
+            ball.bounces_since_brick = 0  # made progress, reset stuck counter
+            if best.hp <= 0:
+                self._maybe_spawn_drop(best.x, best.y)
+            if self.chaos > 0:
+                jitter = self.chaos * 0.3
+                speed = math.hypot(ball.vx, ball.vy)
+                angle = math.atan2(ball.vy, ball.vx)
+                angle += random.uniform(-jitter, jitter)
+                ball.vx = math.cos(angle) * speed
+                ball.vy = math.sin(angle) * speed
+
+        # Paddle collision (visually-aligned)
+        if self.paddle_y is not None:
+            hit_range = self._paddle_hit_range()
+            if hit_range is not None:
+                hl, hr = hit_range
+                if (ball.vy > 0
+                        and ball.y < self.paddle_y
+                        and ny >= self.paddle_y - self.row_step * 0.5
+                        and hl <= nx <= hr):
+                    ny = self.paddle_y - self.row_step * 0.5
+
+                    # Ball-paddle collision physics:
+                    #
+                    # Ball horizontal velocity comes from TWO sources:
+                    #   1. Position contribution: where on paddle ball hits.
+                    #      Outer edges deflect more steeply.
+                    #   2. Paddle friction: paddle's own horizontal motion at
+                    #      impact drags the ball with it (canonical Arkanoid
+                    #      formula: ball.vx += friction * paddle.vx).
+                    # The result is then capped so the ball always retains
+                    # substantial upward motion (no purely-horizontal balls).
+
+                    mid = (hl + hr) / 2.0
+                    half = (hr - hl) / 2.0 or 1.0
+                    position_offset = max(-1.0, min(1.0, (nx - mid) / half))
+                    edge_factor = abs(position_offset)
+
+                    cur_speed = math.hypot(ball.vx, ball.vy) or self._level_base_speed()
+                    base = self._level_base_speed()
+                    mx = self._level_max_speed()
+
+                    # Position contribution: small (max 25% of speed at full
+                    # edge). The big director is paddle friction.
+                    position_contribution = position_offset * cur_speed * 0.25
+
+                    # Paddle friction: paddle's lateral motion drags the ball.
+                    # paddle_friction is 0..1; multiplied by paddle velocity
+                    # gives directly-applied horizontal velocity.
+                    velocity_contribution = (self.paddle_velocity_x
+                                             * self.paddle_friction)
+
+                    # Combine
+                    new_vx = position_contribution + velocity_contribution
+
+                    # Speed: small boost on edge hit (15% max), modest boost
+                    # from energetic paddle hit (paddle moving fast adds 10%
+                    # if paddle_friction high). Mostly preserves cur_speed.
+                    paddle_energy = (abs(self.paddle_velocity_x)
+                                     / max(1.0, self.paddle_speed))
+                    speed_boost = (1.0 + 0.15 * edge_factor
+                                   + 0.10 * paddle_energy)
+                    target_speed = cur_speed * speed_boost
+                    target_speed = max(base * 0.7, min(mx, target_speed))
+
+                    # Cap horizontal so ball retains upward motion (max ~58°
+                    # from vertical: sin(58°)=0.85)
+                    max_horiz = target_speed * 0.85
+                    if abs(new_vx) > max_horiz:
+                        new_vx = math.copysign(max_horiz, new_vx)
+
+                    # Compute upward vy that gives target_speed total
+                    new_vy = -math.sqrt(max(0.001,
+                                            target_speed * target_speed
+                                            - new_vx * new_vx))
+
+                    # Apply chaos as small angle jitter
+                    if self.chaos > 0:
+                        cur_angle = math.atan2(new_vx, -new_vy)
+                        cur_angle += random.uniform(-self.chaos * 0.15,
+                                                    self.chaos * 0.15)
+                        new_vx = math.sin(cur_angle) * target_speed
+                        new_vy = -abs(math.cos(cur_angle) * target_speed)
+
+                    # Stuck-loop breaker: if the ball has been bouncing
+                    # off the paddle repeatedly without destroying a brick,
+                    # it's stuck in a vertical column with no live bricks.
+                    # Inject a strong random angle perturbation to break
+                    # the loop. This applies on every paddle hit past the
+                    # threshold, ramping up if the ball still doesn't make
+                    # progress.
+                    ball.bounces_since_brick += 1
+                    if ball.bounces_since_brick > 6:
+                        # Strength scales up the longer it stays stuck
+                        excess = ball.bounces_since_brick - 6
+                        kick = min(0.6, 0.25 + 0.10 * excess)  # rad, max ~34°
+                        cur_angle = math.atan2(new_vx, -new_vy)
+                        cur_angle += random.uniform(-kick, kick)
+                        # Bias away from playfield edge if paddle is at wall
+                        # (so we don't kick the ball deeper into the corner)
+                        if self.paddle_x <= self.x_min + 0.5:
+                            cur_angle = abs(cur_angle)  # bias rightward
+                        elif (self.paddle_x + self._paddle_width_units()
+                              >= self.x_max - 0.5):
+                            cur_angle = -abs(cur_angle)  # bias leftward
+                        # Cap angle so ball still moves substantially upward
+                        cur_angle = max(-1.05, min(1.05, cur_angle))  # ±60°
+                        new_vx = math.sin(cur_angle) * target_speed
+                        new_vy = -abs(math.cos(cur_angle) * target_speed)
+
+                    ball.vx = new_vx
+                    ball.vy = new_vy
+                    ball.x, ball.y = nx, ny
+                    return
+
+            if ny > self.paddle_y + self.row_step * 0.5:
+                ball.alive = False
+                ball.x, ball.y = nx, ny
+                return
+
+        ball.x = nx
+        ball.y = ny
+        # Detect transition from going up to going down (start of new descent)
+        now_going_up = ball.vy < 0
+        if prev_going_up and not now_going_up and ball.vy > 0:
+            ball.descent_count += 1
+
+    def _maybe_spawn_drop(self, x, y):
+        if self.drop_chance <= 0:
+            return
+        if self.t < self.next_drop_t:
+            return
+        if random.random() >= self.drop_chance:
+            return
+        # Pick drop kind. EXTRA_LIFE is rarer than the others (only spawns
+        # if rng < 0.15 within the kind-pick); the rest split the remainder.
+        roll = random.random()
+        if roll < 0.15:
+            kind = DROP_EXTRA_LIFE
+        elif roll < 0.43:        # 0.15 + 0.28
+            kind = DROP_LONGER
+        elif roll < 0.71:        # + 0.28
+            kind = DROP_SHORTER
+        else:                     # + 0.29
+            kind = DROP_MULTIBALL
+        self.drops.append(Drop(x, y, kind))
+        self.next_drop_t = self.t + random.uniform(
+            self.drop_cooldown * 0.7, self.drop_cooldown * 1.3)
+
+    # --- Rendering ---------------------------------------------------------
+
+    def render(self):
+        for k in self.keys:
+            k.a = k.r = k.g = k.b = 0
+
+        if self.phase == PHASE_GAME_OVER:
+            if not self._render_game_over_text():
+                self._render_red_strobe()
+            self._render_lives()
+            self._render_level_indicator()
+            self._render_keypress_flashes()
+            return
+        if self.phase == PHASE_LEVEL_UP:
+            self._render_rainbow_strobe()
+            self._render_lives()
+            self._render_level_indicator()
+            self._render_keypress_flashes()
+            return
+        if self.phase == PHASE_MISS_FLASH:
+            level = max(0.0, 1.0 - self.phase_t / 0.6)
+            for k in self.keys:
+                k.a = int(255 * level)
+                k.r = int(255 * level)
+                k.g = 0
+                k.b = 0
+            self._render_lives()
+            self._render_level_indicator()
+            self._render_keypress_flashes()
+            return
+
+        self._render_bricks()
+        self._render_drops()
+        self._render_paddle()
+        self._render_balls()
+        self._render_lives()
+        self._render_level_indicator()
+        self._render_keypress_flashes()
+
+    def _render_bricks(self):
+        for b in self.bricks:
+            if b.hp <= 0:
+                continue
+            r, g, bl = HP_COLORS.get(b.hp, (255, 255, 255))
+            k = self.keys[b.key_idx]
+            k.a = 255
+            k.r = r
+            k.g = g
+            k.b = bl
+
+    def _render_drops(self):
+        if self.brick_y_bot is None or self.paddle_y is None:
+            return
+        eligible_ys = set()
+        for k in self.keys:
+            if (is_main_section(k.name)
+                    and self.brick_y_bot <= k.y <= self.paddle_y):
+                eligible_ys.add(k.y)
+
+        for d in self.drops:
+            if not d.alive:
+                continue
+            r, g, bl = DROP_COLORS.get(d.kind, (255, 255, 255))
+            best = None
+            best_d = 1e9
+            for i, k in enumerate(self.keys):
+                if not is_main_section(k.name):
+                    continue
+                if k.y not in eligible_ys:
+                    continue
+                if k.y == self.paddle_y:
+                    continue
+                dd = math.hypot(d.x - k.x, d.y - k.y)
+                if dd < best_d:
+                    best_d = dd
+                    best = i
+            if best is not None:
+                k = self.keys[best]
+                if k.a == 0:
+                    k.a = 255
+                    k.r = r
+                    k.g = g
+                    k.b = bl
+
+    def _render_paddle(self):
+        pa, pr_, pg, pb = self.paddle_argb
+        pl = self.paddle_x
+        pr = self.paddle_x + self._paddle_width_units()
+        for k in self.keys:
+            if k.y != self.paddle_y:
+                continue
+            if not is_main_section(k.name):
+                continue
+            if pl <= k.x <= pr:
+                k.a, k.r, k.g, k.b = pa, pr_, pg, pb
+
+    def _render_balls(self):
+        if not self.balls or self.brick_y_bot is None or self.paddle_y is None:
+            return
+        eligible_ys = set()
+        for k in self.keys:
+            if is_main_section(k.name) and k.y <= self.paddle_y:
+                eligible_ys.add(k.y)
+        eligible_ys.discard(self.paddle_y)
+
+        ba, br, bg, bb = self.ball_argb
+        for ball in self.balls:
+            best = None
+            best_d = 1e9
+            for i, k in enumerate(self.keys):
+                if not is_main_section(k.name):
+                    continue
+                if k.y not in eligible_ys:
+                    continue
+                d = math.hypot(ball.x - k.x, ball.y - k.y)
+                if d < best_d:
+                    best_d = d
+                    best = i
+            if best is not None:
+                k = self.keys[best]
+                k.a, k.r, k.g, k.b = ba, br, bg, bb
+
+    def _render_lives(self):
+        for slot, key_idx in enumerate(self.lives_key_indices):
+            if key_idx >= len(self.keys):
+                continue
+            k = self.keys[key_idx]
+            if slot < self.lives:
+                k.a, k.r, k.g, k.b = 255, 0, 220, 40
+            else:
+                k.a, k.r, k.g, k.b = 255, 60, 0, 0
+
+    def _render_level_indicator(self):
+        if self.level <= 0:
+            return
+        tier = (self.level - 1) // 9
+        within_tier = ((self.level - 1) % 9) + 1
+        saturated = tier >= len(TIER_COLORS)
+        if saturated:
+            r, g, b = TIER_COLORS[-1]
+            pulse = 0.6 + 0.4 * math.sin(self.t * 6)
+            for idx in (self.numpad_tier_indices + self.numpad_number_indices):
+                if idx < len(self.keys):
+                    k = self.keys[idx]
+                    k.a = 255
+                    k.r = int(r * pulse)
+                    k.g = int(g * pulse)
+                    k.b = int(b * pulse)
+            return
+
+        r, g, b = TIER_COLORS[tier]
+
+        for t_idx in range(tier):
+            if t_idx < len(self.numpad_tier_indices):
+                k_idx = self.numpad_tier_indices[t_idx]
+                if k_idx < len(self.keys):
+                    k = self.keys[k_idx]
+                    k.a, k.r, k.g, k.b = 255, r, g, b
+
+        for n_idx in range(within_tier):
+            if n_idx < len(self.numpad_number_indices):
+                k_idx = self.numpad_number_indices[n_idx]
+                if k_idx < len(self.keys):
+                    k = self.keys[k_idx]
+                    k.a, k.r, k.g, k.b = 255, r, g, b
+
+    def _render_red_strobe(self):
+        pulse = 0.5 + 0.5 * math.sin(self.t * 8)
+        for k in self.keys:
+            k.a = 255
+            k.r = int(220 * pulse)
+            k.g = 0
+            k.b = 0
+
+    def _render_game_over_text(self):
+        """Write "GAME" then "OVER" letter-by-letter on a dim red background.
+
+        Returns True if a letter (or word-gap blank) is being shown, False
+        once the text portion is complete (caller should fall through to
+        the red strobe).
+
+        Timing within PHASE_GAME_OVER:
+          0.0 - 2.0s : GAME (4 letters x 0.5s each)
+          2.0 - 2.4s : brief blank gap so the word break is clear
+          2.4 - 4.4s : OVER (4 letters x 0.5s each)
+        """
+        LETTER_DURATION = 0.5
+        WORD_GAP = 0.4
+        word1, word2 = "GAME", "OVER"
+
+        word1_total = len(word1) * LETTER_DURATION  # 2.0s
+        word2_start = word1_total + WORD_GAP        # 2.4s
+        text_total  = word2_start + len(word2) * LETTER_DURATION  # 4.4s
+
+        t = self.phase_t
+        if t >= text_total:
+            return False
+
+        # Determine which letter (if any) to show right now.
+        ch = None
+        if t < word1_total:
+            idx = int(t / LETTER_DURATION)
+            if 0 <= idx < len(word1):
+                ch = word1[idx]
+        elif t >= word2_start:
+            idx = int((t - word2_start) / LETTER_DURATION)
+            if 0 <= idx < len(word2):
+                ch = word2[idx]
+        # else: in the WORD_GAP -> ch stays None (blank between words)
+
+        # Background: dim pulsing red
+        pulse = 0.4 + 0.3 * math.sin(self.t * 6)
+        bg_r = int(70 * pulse)
+        for k in self.keys:
+            k.a = 255
+            k.r = bg_r
+            k.g = 0
+            k.b = 0
+
+        # Light up the letter in bright white for high contrast
+        if ch is not None:
+            pat = LETTERS.get(ch)
+            if pat is not None:
+                row_keys_list = (TEXT_F_KEYS,
+                                 TEXT_NUMBER_KEYS,
+                                 TEXT_QWERTY_KEYS,
+                                 TEXT_HOME_KEYS,
+                                 TEXT_ZXCV_KEYS)
+                for row_idx, row_keys in enumerate(row_keys_list):
+                    if row_idx >= len(pat):
+                        break
+                    row_pattern = pat[row_idx]
+                    for col, c in enumerate(row_pattern):
+                        if c == '#' and col < len(row_keys):
+                            key_name = row_keys[col]
+                            ki = self.keys_by_name.get(key_name)
+                            if ki is not None:
+                                k = self.keys[ki]
+                                k.a = 255
+                                k.r = 255
+                                k.g = 255
+                                k.b = 255
+        return True
+
+    def _render_rainbow_strobe(self):
+        for k in self.keys:
+            hue = (self.rainbow_phase + (k.x * 0.003) + (k.y * 0.005)) % 1.0
+            r, g, b = _hsv_to_rgb(hue, 1.0, 1.0)
+            k.a = 255
+            k.r = r
+            k.g = g
+            k.b = b
+
+    def _render_keypress_flashes(self):
+        for i, t in self.flash.items():
+            if i >= len(self.keys):
+                continue
+            k = self.keys[i]
+            level = max(0.0, min(1.0, t / 0.4))
+            k.r = min(255, int(k.r + (255 - k.r) * level))
+            k.g = min(255, int(k.g + (255 - k.g) * level))
+            k.b = min(255, int(k.b + (255 - k.b) * level))
+
+
+def _parse_argb(value):
+    if len(value) >= 8:
+        return (int(value[0:2], 16), int(value[2:4], 16),
+                int(value[4:6], 16), int(value[6:8], 16))
+    raise ValueError(value)
+
+
+def _hsv_to_rgb(h, s, v):
+    i = int(h * 6); f = h * 6 - i
+    p = v * (1 - s); q = v * (1 - f * s); t = v * (1 - (1 - f) * s)
+    i = i % 6
+    if i == 0: r, g, b = v, t, p
+    elif i == 1: r, g, b = q, v, p
+    elif i == 2: r, g, b = p, v, t
+    elif i == 3: r, g, b = p, q, v
+    elif i == 4: r, g, b = t, p, v
+    else:        r, g, b = v, p, q
+    return int(r * 255), int(g * 255), int(b * 255)
+
+
+# === Run loop ==============================================================
+
+def ckb_run():
+    game = Game()
+
+    cmd, p1, p2 = read_words()
+    while not (cmd == "begin" and p1 == "keymap"):
+        if not cmd: return -1
+        cmd, p1, p2 = read_words()
+    cmd, p1, p2 = read_words()
+    if cmd != "keycount": return -1
+    while True:
+        cmd, p1, p2 = read_words()
+        if cmd == "end" and p1 == "keymap":
+            break
+        if cmd == "key":
+            try:
+                xs, ys = p2.split(",")
+                game.keys.append(Key(p1, int(xs), int(ys)))
+            except ValueError:
+                continue
+
+    game.init()
+
+    cmd, p1, p2 = read_words()
+    while not (cmd == "begin" and p1 == "params"):
+        if not cmd: return -1
+        cmd, p1, p2 = read_words()
+    while True:
+        cmd, p1, p2 = read_words()
+        if cmd == "end" and p1 == "params":
+            break
+        if cmd == "param":
+            game.set_param(p1, p2)
+
+    cmd, p1, p2 = read_words()
+    while not (cmd == "begin" and p1 == "run"):
+        if not cmd: return -1
+        cmd, p1, p2 = read_words()
+    emit_line("begin run")
+    flush()
+
+    while True:
+        cmd, p1, p2 = read_words()
+        if not cmd or (cmd == "end" and p1 == "run"):
+            break
+        if cmd == "frame":
+            game.render()
+            emit_line("begin frame")
+            for k in game.keys:
+                emit_line("argb {} {:02x}{:02x}{:02x}{:02x}".format(
+                    k.name, k.a, k.r, k.g, k.b))
+            emit_line("end frame")
+            flush()
+        elif cmd == "time":
+            try: dt = float(p1)
+            except ValueError: dt = 0.0
+            game.advance(dt)
+        elif cmd == "key":
+            down = p2 in ("down", "1") if p2 else True
+            game.keypress(p1, down)
+        elif cmd == "begin" and p1 == "params":
+            while True:
+                c2, p1b, p2b = read_words()
+                if c2 == "end" and p1b == "params":
+                    break
+                if c2 == "param":
+                    game.set_param(p1b, p2b)
+        elif cmd in ("start", "stop"):
+            pass
+
+    emit_line("end run")
+    flush()
+    return 0
+
+
+def main():
+    if len(sys.argv) >= 2:
+        if sys.argv[1] == "--ckb-info":
+            ckb_info()
+            return 0
+        if sys.argv[1] == "--ckb-run":
+            return ckb_run()
+    sys.stderr.write("This program must be run from within ckb\n")
+    return -1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,20 @@
+# ckb-mode-on-lock configuration.
+#
+# Install at: ~/.config/ckb-next/lock.conf
+# (alongside ckb-next-gui's own ckb-next.conf)
+#
+# Mode and profile values are passed verbatim to `ckb-next` as a
+# `--mode <name>` / `--profile <name>` argument, so they must match a
+# mode/profile name that exists in your ckb-next-gui setup.
+#
+# Lines starting with `#` are comments. Quoting is optional.
+
+# Active animation while the screen is unlocked.
+mode_unlocked = EKG
+
+# Animation while the screen is locked.
+mode_locked   = BrickBreaker
+
+# Optional: also switch the active profile on lock/unlock. Set to a
+# profile name, or `none` to leave the profile alone.
+profile = none
