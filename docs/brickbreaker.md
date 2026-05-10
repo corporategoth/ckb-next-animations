@@ -5,6 +5,8 @@ playfield. Each game restart rolls a new "AI player" with randomized
 skill, so runs range from comically bad (loses on level 1) to brilliant
 (clears all 36 levels).
 
+![Brick Breaker recording](../imgs/brickbreaker.gif)
+
 ## Install
 
 ```sh

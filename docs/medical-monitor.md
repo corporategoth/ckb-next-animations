@@ -4,6 +4,8 @@ Turns the keyboard into a hospital bedside monitor. Different zones of
 the keyboard show different vitals, and a defibrillator state machine
 reacts to whether you're typing or idle.
 
+![Medical Monitor recording](../imgs/medical-monitor.gif)
+
 ## Install
 
 ```sh

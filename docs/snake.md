@@ -6,6 +6,8 @@ each time it eats one, and speeds up the longer it gets. It dies if it
 runs into its own body or off the edge of its playfield. After death
 it respawns small.
 
+![Snake recording](../imgs/snake.gif)
+
 ## Install
 
 ```sh
