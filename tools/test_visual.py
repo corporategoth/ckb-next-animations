@@ -2099,11 +2099,16 @@ def _resolve_animation(arg):
     """Resolves a bare animation name against the standard ckb-next
     install dirs, so users can say `random` instead of a full path.
     Anything containing a path separator or starting with '.' / '/'
-    is returned untouched."""
+    is returned untouched.
+
+    User-local installs win over the system path so that when the same
+    animation name exists in both (e.g. our `snake` shadowing the
+    bundled one), the user-local copy is what gets tested. Mirrors how
+    PATH-style lookups normally favour `~/.local/...` before /usr."""
     if os.sep in arg or arg.startswith("."):
         return os.path.abspath(arg)
-    for base in ("/usr/lib/ckb-next-animations",
-                 os.path.expanduser("~/.local/share/ckb-next/animations")):
+    for base in (os.path.expanduser("~/.local/share/ckb-next/animations"),
+                 "/usr/lib/ckb-next-animations"):
         cand = os.path.join(base, arg)
         if os.path.isfile(cand) and os.access(cand, os.X_OK):
             return cand
@@ -2119,8 +2124,9 @@ def main():
                     "press Tab once running.")
     ap.add_argument("animation",
                     help="path or name of the animation. Bare names are "
-                         "resolved against /usr/lib/ckb-next-animations/ "
-                         "and ~/.local/share/ckb-next/animations/.")
+                         "resolved against ~/.local/share/ckb-next/animations/ "
+                         "first, then /usr/lib/ckb-next-animations/ — so a "
+                         "user-installed copy shadows the bundled one.")
     ap.add_argument("--keymap", default=keymap_path(),
                     help="JSON keymap captured by tools/dump_keymap "
                          "(default: ~/.cache/ckb-next/keymap.json)")

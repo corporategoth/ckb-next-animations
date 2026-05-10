@@ -35,9 +35,10 @@ uv sync   # creates .venv with pygame-ce
 ## Running
 
 The animation is the only required CLI argument. Bare names are
-resolved against `/usr/lib/ckb-next-animations/` and
-`~/.local/share/ckb-next/animations/`; absolute or relative paths
-work too. Everything else (params, presets, speed, colors) is
+resolved against `~/.local/share/ckb-next/animations/` first, then
+`/usr/lib/ckb-next-animations/` — so a user-installed copy shadows
+the bundled one of the same name (e.g. this repo's `snake`
+overriding the system `snake`). Absolute or relative paths work too. Everything else (params, presets, speed, colors) is
 configured live in the window.
 
 ```sh
