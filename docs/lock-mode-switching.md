@@ -6,6 +6,15 @@ mode (and optionally profile). Use it to run a calmer (or no)
 animation while you're away from the keyboard, and snap back to the
 active mode on unlock.
 
+Each side (locked / unlocked) accepts either a single mode name or a
+comma-separated list. With 2+ modes, the matching `strategy_*` setting
+decides which one is picked per lock/unlock event:
+
+| Strategy      | Behaviour                                                                                                       |
+| ------------- | --------------------------------------------------------------------------------------------------------------- |
+| `random`      | Uniform random; never repeats the immediately previous pick when 2+ modes are listed (so the keyboard always changes). |
+| `round_robin` | Cycle through the list in declared order. (Aliases: `round-robin`, `rr`, `cycle`.)                              |
+
 **Cross-DE.** Listens on both
 `org.freedesktop.ScreenSaver.ActiveChanged` (KDE Plasma, XFCE,
 Cinnamon, MATE, …) and `org.gnome.ScreenSaver.ActiveChanged` (GNOME),
@@ -29,8 +38,10 @@ Three layers, in priority order (highest first):
 
 1. **Environment variables** (set under `[Service]` in the unit file).
    Useful for one-off overrides:
-   - `CKB_LOCK_MODE_UNLOCKED` — mode name to switch to on unlock
-   - `CKB_LOCK_MODE_LOCKED` — mode name to switch to on lock
+   - `CKB_LOCK_MODE_UNLOCKED` — mode name or comma list for unlock
+   - `CKB_LOCK_MODE_LOCKED` — mode name or comma list for lock
+   - `CKB_LOCK_STRATEGY_UNLOCKED` — `random` or `round_robin`
+   - `CKB_LOCK_STRATEGY_LOCKED` — `random` or `round_robin`
    - `CKB_LOCK_PROFILE` — profile name (optional), or `none`
 
 2. **`~/.config/ckb-next/lock.conf`** — recommended. Lives alongside
@@ -38,15 +49,30 @@ Three layers, in priority order (highest first):
    `key = value` format, lines starting with `#` are comments:
 
    ```ini
+   # Single mode on unlock:
    mode_unlocked = EKG
-   mode_locked   = BrickBreaker
-   profile       = none      # or a profile name
+
+   # Pool of modes on lock; one is picked per lock event:
+   mode_locked       = BrickBreaker, Snake, Wave
+   strategy_locked   = random      # or round_robin
+
+   profile = none                  # or a profile name
    ```
 
-3. **Defaults** compiled into the top of the script
-   (`MODE_UNLOCKED = "EKG"`, `MODE_LOCKED = "BrickBreaker"`,
-   `PROFILE = None`) — edit them in place if you'd rather not maintain
-   a separate file.
+   Setting just `mode_locked = BrickBreaker` (a single name) keeps the
+   pre-existing single-mode behaviour — the strategy is only consulted
+   when 2+ modes are listed.
+
+3. **Defaults** compiled into the top of the script — edit them in
+   place if you'd rather not maintain a separate file:
+
+   ```python
+   MODE_UNLOCKED     = "EKG"
+   MODE_LOCKED       = "BrickBreaker"
+   PROFILE           = None
+   STRATEGY_UNLOCKED = "random"
+   STRATEGY_LOCKED   = "random"
+   ```
 
 Values are passed verbatim to `ckb-next` as a `--mode <name>` /
 `--profile <name>` argument, so they must match a mode/profile name

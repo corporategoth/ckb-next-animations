@@ -10,10 +10,24 @@
 # Lines starting with `#` are comments. Quoting is optional.
 
 # Active animation while the screen is unlocked.
+# Either a single mode name, or a comma-separated list. With 2+
+# entries the matching `strategy_unlocked` setting picks one per
+# unlock event.
 mode_unlocked = EKG
 
 # Animation while the screen is locked.
-mode_locked   = BrickBreaker
+# A comma-separated list rotates between the named modes on each lock
+# event. Use `strategy_locked` to choose between random pick and
+# round-robin cycling.
+mode_locked = BrickBreaker, Snake
+
+# Selection strategy for each side. Only matters when the matching
+# mode_* setting has 2+ entries. Recognized values:
+#   random        pick uniformly; never repeats the immediately
+#                 previous pick when 2+ modes are listed
+#   round_robin   cycle through the list in declared order
+strategy_unlocked = random
+strategy_locked   = random
 
 # Optional: also switch the active profile on lock/unlock. Set to a
 # profile name, or `none` to leave the profile alone.

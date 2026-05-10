@@ -17,30 +17,42 @@ Mode and profile switching is delegated to the `ckb-next` CLI:
     ckb-next --profile <name>     # switch profile (all devices)
 so any name that works in the GUI works here -- no Qt-config parsing.
 
+Each side (locked / unlocked) accepts either a single mode name or a
+comma-separated list. With 2+ modes, the script picks one per
+lock/unlock event using the configured strategy:
+    random        pick uniformly at random; never repeats the
+                  immediately previous pick when 2+ modes are listed
+    round_robin   cycle through the list in order
+
 ----------------------------------------------------------------------
 Configuration sources -- highest priority first:
 
   1. Environment variables (set by the systemd unit or your shell):
-       CKB_LOCK_MODE_UNLOCKED   mode name to switch to on unlock
-       CKB_LOCK_MODE_LOCKED     mode name to switch to on lock
-       CKB_LOCK_PROFILE         profile name (optional), or "none"
+       CKB_LOCK_MODE_UNLOCKED          mode name (or comma list)
+       CKB_LOCK_MODE_LOCKED            mode name (or comma list)
+       CKB_LOCK_STRATEGY_UNLOCKED      "random" or "round_robin"
+       CKB_LOCK_STRATEGY_LOCKED        "random" or "round_robin"
+       CKB_LOCK_PROFILE                profile name, or "none"
 
   2. Config file at $XDG_CONFIG_HOME/ckb-next/lock.conf (default
      ~/.config/ckb-next/lock.conf, alongside ckb-next-gui's own
      ckb-next.conf):
-       mode_unlocked = ...
-       mode_locked   = ...
-       profile       = ...
+       mode_unlocked     = EKG
+       mode_locked       = BrickBreaker, Snake, Wave
+       strategy_locked   = random           # or round_robin
+       strategy_unlocked = random
+       profile           = none
      Lines starting with `#` are comments. Values may be quoted.
 
   3. The defaults in the CONFIG block below.
 
-Values are passed verbatim to `ckb-next` as a mode/profile name. Set a
-value to `none` (or leave it unset) to skip that switch.
+Values are passed verbatim to `ckb-next` as a mode/profile name. Set
+a mode value to `none` (or leave it unset) to skip that switch.
 ----------------------------------------------------------------------
 """
 
 import os
+import random
 import subprocess
 import sys
 from pathlib import Path
@@ -48,10 +60,14 @@ from pathlib import Path
 
 # === CONFIG ================================================================
 # Edit in place, or override via the config file / env vars described in
-# the module docstring above.
-MODE_UNLOCKED = "EKG"             # ckb-next mode name, or None
-MODE_LOCKED   = "BrickBreaker"    # ckb-next mode name, or None
-PROFILE       = None              # ckb-next profile name, or None
+# the module docstring above. Mode values can be a single name or a
+# comma-separated list; with 2+ entries the corresponding strategy
+# decides which one is applied per lock/unlock event.
+MODE_UNLOCKED     = "EKG"             # mode name, comma list, or None
+MODE_LOCKED       = "BrickBreaker"    # mode name, comma list, or None
+PROFILE           = None              # profile name, or None
+STRATEGY_UNLOCKED = "random"          # "random" or "round_robin"
+STRATEGY_LOCKED   = "random"          # "random" or "round_robin"
 # ===========================================================================
 
 
@@ -74,6 +90,12 @@ def _xdg_config_home():
     return Path(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"))
 
 
+def _strip_quotes(s):
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in ("'", '"'):
+        return s[1:-1]
+    return s
+
+
 def _norm(value):
     """'none' / '' -> None; otherwise -> str. Strips surrounding quotes."""
     if value is None:
@@ -82,9 +104,44 @@ def _norm(value):
     s = s.strip()
     if s == "" or s.lower() == "none":
         return None
-    if len(s) >= 2 and s[0] == s[-1] and s[0] in ("'", '"'):
-        s = s[1:-1]
-    return s
+    return _strip_quotes(s)
+
+
+def _parse_modes(value):
+    """Parse a single mode name or a comma-separated list into [str, ...].
+    Empty string, None, and tokens equal to 'none' are dropped (so a
+    list like 'EKG, none, Snake' yields ['EKG', 'Snake'] -- handy when
+    a env override means to disable one entry of an inherited list)."""
+    if value is None:
+        return []
+    s = value if isinstance(value, str) else str(value)
+    out = []
+    for raw in s.split(","):
+        token = _strip_quotes(raw.strip())
+        if token and token.lower() != "none":
+            out.append(token)
+    return out
+
+
+_STRATEGY_ALIASES = {
+    "random": "random", "rand": "random", "shuffle": "random",
+    "round_robin": "round_robin", "round-robin": "round_robin",
+    "roundrobin": "round_robin", "rr": "round_robin", "cycle": "round_robin",
+}
+
+
+def _parse_strategy(value, default="random"):
+    """Normalize a strategy name. Unknown / empty values fall back to
+    `default` (and warn so config typos don't fail silently)."""
+    if value is None:
+        return default
+    s = str(value).strip().lower()
+    if not s:
+        return default
+    if s in _STRATEGY_ALIASES:
+        return _STRATEGY_ALIASES[s]
+    warn(f"unknown strategy {value!r}; falling back to {default!r}")
+    return default
 
 
 def _load_config_file():
@@ -103,20 +160,82 @@ def _load_config_file():
 
 
 def apply_overrides():
-    """Mutate module-level MODE_UNLOCKED / MODE_LOCKED / PROFILE."""
+    """Mutate module-level config from env / file."""
     global MODE_UNLOCKED, MODE_LOCKED, PROFILE
+    global STRATEGY_UNLOCKED, STRATEGY_LOCKED
     file_cfg = _load_config_file()
 
-    def pick(env_name, file_key, current):
+    def raw_pick(env_name, file_key, current):
+        """Return the raw string value (not normalized) from the
+        highest-priority source that defines this setting, or
+        `current` if neither env nor file does."""
         if env_name in os.environ:
-            return _norm(os.environ[env_name])
+            return os.environ[env_name]
         if file_key in file_cfg:
-            return _norm(file_cfg[file_key])
-        return _norm(current)
+            return file_cfg[file_key]
+        return current
 
-    MODE_UNLOCKED = pick("CKB_LOCK_MODE_UNLOCKED", "mode_unlocked", MODE_UNLOCKED)
-    MODE_LOCKED   = pick("CKB_LOCK_MODE_LOCKED",   "mode_locked",   MODE_LOCKED)
-    PROFILE       = pick("CKB_LOCK_PROFILE",       "profile",       PROFILE)
+    # Mode lists stay as raw strings here -- _parse_modes splits later
+    # in main(). _norm here would fold a "none" entry to None, which
+    # would round-trip badly through the comma-list parser.
+    MODE_UNLOCKED = raw_pick("CKB_LOCK_MODE_UNLOCKED", "mode_unlocked",
+                             MODE_UNLOCKED)
+    MODE_LOCKED   = raw_pick("CKB_LOCK_MODE_LOCKED",   "mode_locked",
+                             MODE_LOCKED)
+    PROFILE       = _norm(raw_pick("CKB_LOCK_PROFILE", "profile", PROFILE))
+    STRATEGY_UNLOCKED = _parse_strategy(
+        raw_pick("CKB_LOCK_STRATEGY_UNLOCKED",
+                 "strategy_unlocked", STRATEGY_UNLOCKED),
+        default="random")
+    STRATEGY_LOCKED = _parse_strategy(
+        raw_pick("CKB_LOCK_STRATEGY_LOCKED",
+                 "strategy_locked", STRATEGY_LOCKED),
+        default="random")
+
+
+# === Mode picker ===========================================================
+
+class ModePicker:
+    """Holds a list of mode names and yields one per `pick()` call.
+
+    With 0 modes pick() returns None (skip the switch). With exactly
+    1 mode pick() always returns it. With 2+ modes the strategy
+    decides:
+      * round_robin -- cycle through the list in declared order
+      * random      -- uniform random, but never repeat the immediately
+                       preceding pick (keeps the same mode from coming
+                       up twice in a row, which would produce no
+                       visible change on the keyboard)."""
+
+    def __init__(self, modes, strategy):
+        self.modes = list(modes)
+        self.strategy = strategy
+        self.rr_idx = 0
+        self.last_pick = None
+
+    def pick(self):
+        if not self.modes:
+            return None
+        if len(self.modes) == 1:
+            self.last_pick = self.modes[0]
+            return self.modes[0]
+        if self.strategy == "round_robin":
+            mode = self.modes[self.rr_idx]
+            self.rr_idx = (self.rr_idx + 1) % len(self.modes)
+        else:
+            choices = [m for m in self.modes if m != self.last_pick]
+            if not choices:
+                choices = self.modes
+            mode = random.choice(choices)
+        self.last_pick = mode
+        return mode
+
+    def describe(self):
+        if not self.modes:
+            return "<no modes>"
+        if len(self.modes) == 1:
+            return repr(self.modes[0])
+        return "{} of {}".format(self.strategy, self.modes)
 
 
 # === Talking to ckb-next ==================================================
@@ -176,22 +295,26 @@ def event_loop(on_lock, on_unlock, initial_state="unlocked"):
 
 def main():
     apply_overrides()
+    unlocked = ModePicker(_parse_modes(MODE_UNLOCKED), STRATEGY_UNLOCKED)
+    locked   = ModePicker(_parse_modes(MODE_LOCKED),   STRATEGY_LOCKED)
     log(f"ckb-mode-on-lock starting "
-        f"(unlocked={MODE_UNLOCKED!r}, locked={MODE_LOCKED!r}, "
+        f"(unlocked={unlocked.describe()}, locked={locked.describe()}, "
         f"profile={PROFILE!r})")
 
     # Initial state: assume unlocked. The next ActiveChanged event will
     # correct it if the screen happens to be locked when we start.
     log("Screen UNLOCKED (initial)")
-    switch(MODE_UNLOCKED)
+    switch(unlocked.pick())
 
     def on_lock():
-        log("Screen LOCKED")
-        switch(MODE_LOCKED)
+        mode = locked.pick()
+        log(f"Screen LOCKED -> {mode!r}")
+        switch(mode)
 
     def on_unlock():
-        log("Screen UNLOCKED")
-        switch(MODE_UNLOCKED)
+        mode = unlocked.pick()
+        log(f"Screen UNLOCKED -> {mode!r}")
+        switch(mode)
 
     event_loop(on_lock, on_unlock)
 
