@@ -2143,6 +2143,13 @@ def main():
                          "window.")
     ap.add_argument("--window", default="1400x460",
                     help="window size as WxH (default 1400x460)")
+    ap.add_argument("--speed", type=float, default=None, metavar="N",
+                    help="override the initial speed multiplier "
+                         "(animation time / wall time). For animations "
+                         "that declare `harness speed`, this replaces the "
+                         "declared default; for ones that don't, it still "
+                         "scales the time delta the harness sends. Must "
+                         "be > 0.")
     ap.add_argument("--record", default=None, metavar="FILE",
                     help="record the rendered output to FILE. Format is "
                          "picked from the extension: .gif uses ffmpeg's "
@@ -2161,6 +2168,10 @@ def main():
                     help="don't open a window — render to an off-screen "
                          "surface only. Useful for unattended captures.")
     args = ap.parse_args()
+
+    if args.speed is not None and args.speed <= 0:
+        sys.stderr.write("--speed must be > 0\n")
+        return 2
 
     exe = _resolve_animation(args.animation)
     if not os.path.isfile(exe) or not os.access(exe, os.X_OK):
@@ -2255,7 +2266,14 @@ def main():
     # `harness speed default=...` line in its --ckb-info.
     speed_decl = info["harness"].get("speed")
     speed_enabled = speed_decl is not None
-    initial_speed = float(speed_decl["default"]) if speed_enabled and "default" in speed_decl else 1.0
+    initial_speed = (float(speed_decl["default"])
+                     if speed_enabled and "default" in speed_decl else 1.0)
+    # `--speed N` overrides whatever the animation declared. Useful for
+    # unattended recordings (e.g. brickbreaker at 5× by default would
+    # bake a 5× run into the captured GIF) and for forcing real-time
+    # playback even on animations that auto-fast-forward.
+    if args.speed is not None:
+        initial_speed = args.speed
     speed = initial_speed
 
     # Bundled ckb-next animations expect the daemon to feed every declared

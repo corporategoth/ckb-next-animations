@@ -116,6 +116,20 @@ settings rows.
 When the animation declares `harness speed`, `+` / `-` scrub the
 multiplier and `1` resets it to the declared default.
 
+`--speed N` overrides the initial multiplier from the CLI — useful
+when recording (e.g. capturing brickbreaker at real-time even though
+it declares `harness speed default=5.0`) or when you want to start
+slowed-down/sped-up without reaching for the panel:
+
+```sh
+uv run tools/test_visual.py brickbreaker --speed 1   # real-time
+uv run tools/test_visual.py snake        --speed 5   # 5× faster
+```
+
+The flag works even on animations that don't declare `harness
+speed` — the time delta is always scaled, just the in-app `+`/`-`
+hotkeys stay disabled.
+
 ## In the param panel
 
 | Key          | Action                                            |
