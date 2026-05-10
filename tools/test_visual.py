@@ -213,37 +213,33 @@ def label_for(name):
 ROUND_KEYS = frozenset({"light", "lock"})
 
 
-# K70 ANSI cap-position overrides as (cap_x, cap_y, cap_w, cap_h) in
-# keymap units. The ckb-next daemon emits LED positions, not cap positions,
-# and the LED-to-cap relationship is irregular for wide keys, so for the
-# K70 ANSI layout we just hardcode the visually-correct cap rects. The
-# typing block's right edge is x=180; the right cluster (ins/del/...)
-# starts at x=184, mirroring the F-row's natural F12→PrtScn gap.
-K70_OVERRIDES = {
-    # Typing-row left widenings (force cap_left = 0 to align with esc/grave).
-    "tab":      (0,   39, 18, 12),  # 1.5u
-    "caps":     (0,   51, 21, 12),  # 1.75u
-    "lshift":   (0,   63, 27, 12),  # 2.25u
-    # Typing-row right widenings (cap_right = 180, abutting the key on the
-    # left so there's no internal gap inside the typing block).
-    "bspace":   (156, 27, 24, 12),  # 2u
-    "bslash":   (162, 39, 18, 12),  # 1.5u
-    "enter":    (153, 51, 27, 12),  # 2.25u
-    "rshift":   (147, 63, 33, 12),  # 2.75u
-    # F12 sized like F11 (the data's F12→PrtScn gap is 16, just over
-    # default, which would otherwise stretch F12 wider than F11).
-    "f12":      (168, 14, 12, 12),
-    # Right cluster: PgUp/PgDn/Pause have small (<1.4×) gaps to numpad/
-    # media so the heuristic would over-stretch them. Force 1u.
-    "pause":    (208, 14, 12, 12),
-    "pgup":     (208, 27, 12, 12),
-    "pgdn":     (208, 39, 12, 12),
-    # Bottom row: lctrl ≈ lalt = ralt > lwin = rwin = rmenu, rctrl widest;
-    # space fills the entire distance between the alts.
-    "lctrl":    (0,   75, 15, 12),
-    "lwin":     (15,  75, 12, 12),
-    "lalt":     (27,  75, 15, 12),
-    "space":    (42,  75, 81, 12),
+# Cap-position overrides for keys whose shape can't be inferred from
+# row-neighbor LED gaps, as (cap_x, cap_y, cap_w, cap_h) in keymap units.
+# The ckb-next daemon emits LED positions, not cap positions, and the
+# LED-to-cap relationship is irregular for wide/oddly-shaped keys.
+#
+# compute_cap_layout handles the regular cases generically: the leftmost
+# key in a row whose LED is offset from x=0 (tab/caps/lshift) snaps to
+# cap_left=0, and the last typing-block key before the right cluster
+# (bspace/bslash/enter/rshift/f12) snaps cap_right to RIGHT_TYPING_EDGE.
+# What's left here is the irreducible Corsair-specific shape data:
+#   - Bottom row: LEDs aren't centered on caps and ANSI widths (1.25u
+#     mods, 1.5u ctrls, 6.25u space) aren't recoverable from gaps.
+#   - Numpad: num0 is double-wide, numplus/numenter span two rows.
+#
+# These widths match the K70 ANSI layout but are reasonable defaults for
+# all Corsair full-size ANSI boards (K65/K70/K95/K100). Per-keyboard
+# tweaks could go here if a model deviates.
+CORSAIR_CAP_OVERRIDES = {
+    # Bottom row: lctrl = rctrl, lalt = ralt, lwin = rwin = rmenu;
+    # space fills the entire distance between the alts. lwin's right edge
+    # lands slightly past lshift's, and space starts slightly past lalt's
+    # cap_left in the row above — both visible cues that lctrl matches
+    # rctrl in width on Corsair ANSI bottom rows.
+    "lctrl":    (0,   75, 18, 12),
+    "lwin":     (18,  75, 12, 12),
+    "lalt":     (30,  75, 15, 12),
+    "space":    (45,  75, 78, 12),
     "ralt":     (123, 75, 15, 12),
     "rwin":     (138, 75, 12, 12),
     "rmenu":    (150, 75, 12, 12),
@@ -253,6 +249,14 @@ K70_OVERRIDES = {
     "numplus":  (259, 39, 12, 24),
     "numenter": (259, 63, 12, 24),
 }
+
+# Right edge of the main typing block in keymap units. Wide right-edge
+# typing keys (bspace/bslash/enter/rshift, plus f12) snap their cap_right
+# to this column; the right cluster (ins/del/home/end/pgup/pgdn/...)
+# begins 4 units further at x=184, matching the F-row's F12→PrtScn gap.
+# Derived from rctrl, the rightmost overridden bottom-row key.
+RIGHT_TYPING_EDGE = (CORSAIR_CAP_OVERRIDES["rctrl"][0]
+                     + CORSAIR_CAP_OVERRIDES["rctrl"][2])
 
 
 def compute_defaults(keys):
@@ -282,10 +286,20 @@ def compute_defaults(keys):
 
 
 def compute_cap_layout(keys, default_w, default_h):
-    """For every key return (cap_x, cap_y, cap_w, cap_h). K70_OVERRIDES
-    win where present; otherwise we use captured x/y as the cap top-left
-    and infer the width from row-neighbor distance, clamping any large
-    gap to default_w (treated as a cluster separator)."""
+    """For every key return (cap_x, cap_y, cap_w, cap_h). Resolution order
+    per key, walking each row left-to-right:
+
+      1. CORSAIR_CAP_OVERRIDES (bottom row, numpad spans).
+      2. Right-snap: if the next key sits in the right cluster
+         (next.x >= RIGHT_TYPING_EDGE) and this key doesn't, this is the
+         rightmost typing-block key — its cap abuts the previous neighbor
+         on the left and reaches RIGHT_TYPING_EDGE on the right. Covers
+         f12, bspace, bslash, enter, rshift.
+      3. Left-snap: if this is the leftmost key in the row and its LED is
+         offset (0 < x < default_w), the cap snaps to cap_left=0 and
+         abuts the right neighbor. Covers tab, caps, lshift.
+      4. Default: cap top-left = LED, width from row-neighbor distance,
+         clamping large gaps to default_w (cluster separators)."""
     rows = {}
     for k in keys:
         rows.setdefault(k["y"], []).append(k)
@@ -293,19 +307,41 @@ def compute_cap_layout(keys, default_w, default_h):
         rows[y].sort(key=lambda k: k["x"])
 
     layout = {}
-    for k in keys:
-        name = k["name"]
-        if name in K70_OVERRIDES:
-            layout[name] = K70_OVERRIDES[name]
-            continue
-        row = rows[k["y"]]
-        i = row.index(k)
-        if i + 1 < len(row):
-            gap = row[i + 1]["x"] - k["x"]
-            w = default_w if gap > 1.2 * default_w else gap
-        else:
-            w = default_w
-        layout[name] = (k["x"], k["y"], w, default_h)
+    for y in sorted(rows):
+        row = rows[y]
+        for i, k in enumerate(row):
+            name = k["name"]
+            if name in CORSAIR_CAP_OVERRIDES:
+                layout[name] = CORSAIR_CAP_OVERRIDES[name]
+                continue
+
+            next_k = row[i + 1] if i + 1 < len(row) else None
+
+            # Right-snap: last typing-block key before the right cluster.
+            if (next_k is not None
+                    and k["x"] < RIGHT_TYPING_EDGE
+                    and next_k["x"] >= RIGHT_TYPING_EDGE):
+                if i > 0:
+                    prev_x, _, prev_w, _ = layout[row[i - 1]["name"]]
+                    cap_left = prev_x + prev_w
+                else:
+                    cap_left = k["x"]
+                layout[name] = (cap_left, k["y"],
+                                RIGHT_TYPING_EDGE - cap_left, default_h)
+                continue
+
+            # Left-snap: leftmost row key whose LED is offset from origin.
+            if i == 0 and 0 < k["x"] < default_w and next_k is not None:
+                layout[name] = (0, k["y"], next_k["x"], default_h)
+                continue
+
+            # Default: width from gap to next neighbor, cluster gaps clamped.
+            if next_k is not None:
+                gap = next_k["x"] - k["x"]
+                w = default_w if gap > 1.2 * default_w else gap
+            else:
+                w = default_w
+            layout[name] = (k["x"], k["y"], w, default_h)
     return layout
 
 
