@@ -1,0 +1,189 @@
+#!/usr/bin/env python3
+"""dump_keymap - one-shot ckb-next animation that captures the keymap to JSON.
+
+Run once from the ckb-next GUI to record the exact key layout your daemon
+sends to animations. Writes to:
+    $XDG_CACHE_HOME/ckb-next/keymap.json
+    (default: ~/.cache/ckb-next/keymap.json)
+
+The companion test harness (tools/test_visual.py) reads that file to drive
+brickbreaker offline at hyper speed for visual testing.
+
+Install:
+    cp tools/dump_keymap ~/.local/share/ckb-next/animations/
+    chmod +x ~/.local/share/ckb-next/animations/dump_keymap
+Then in ckb-next: Settings -> Animation Scripts -> Re-scan,
+apply the "Capture Keymap" animation once, then switch back to your
+preferred animation. While running, every key glows soft cyan as a
+visual confirmation that the capture succeeded.
+
+Copyright (c) 2026 Preston A. Elder <prez@neuromancy.net>.
+Licensed under the MIT License.
+"""
+import json
+import os
+import sys
+
+
+# === Protocol helpers (same encoding as brickbreaker / ckb-next) ===========
+
+def _need_encode(c):
+    o = ord(c)
+    return (o <= 0x2C or o == 0x2F or 0x3A <= o <= 0x40
+            or o == 0x5B or o == 0x5D or o >= 0x7F)
+
+
+def url_encode(s):
+    out = []
+    for c in s:
+        if _need_encode(c):
+            out.append("%{:02X}".format(ord(c)))
+        else:
+            out.append(c)
+    return "".join(out)
+
+
+def url_decode(s):
+    out, i = [], 0
+    while i < len(s):
+        if s[i] == "%" and i + 2 < len(s):
+            try:
+                out.append(chr(int(s[i + 1:i + 3], 16)))
+                i += 3
+                continue
+            except ValueError:
+                pass
+        out.append(s[i])
+        i += 1
+    return "".join(out)
+
+
+def read_words():
+    line = sys.stdin.readline()
+    if not line:
+        return ("", "", "")
+    parts = line.strip().split(None, 2)
+    while len(parts) < 3:
+        parts.append("")
+    return (url_decode(parts[0]), url_decode(parts[1]), url_decode(parts[2]))
+
+
+def emit_line(s): sys.stdout.write(s + "\n")
+def flush(): sys.stdout.flush()
+
+
+def output_path():
+    base = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
+    return os.path.join(base, "ckb-next", "keymap.json")
+
+
+# === Plugin info ===========================================================
+
+def ckb_info():
+    emit_line("guid " + url_encode("{4F2E1B33-9D55-4F2A-AC7E-3E6D9F1B0A77}"))
+    emit_line("name " + url_encode("Capture Keymap"))
+    emit_line("version " + url_encode("1.0"))
+    emit_line("year 2026")
+    emit_line("author " + url_encode("Preston A. Elder <prez@neuromancy.net>"))
+    emit_line("license " + url_encode("MIT"))
+    emit_line("description " + url_encode(
+        "Diagnostic: writes the daemon's keymap to "
+        "~/.cache/ckb-next/keymap.json for offline visual testing. "
+        "Lights all keys cyan once captured. Run once, then switch "
+        "back to a normal animation."))
+    # ckb-next's GUI rejects scripts without at least one param/preset, so
+    # we declare a no-op toggle just to satisfy the loader.
+    emit_line("param bool _unused " + url_encode("(no settings)") + "  0")
+
+    emit_line("kpmode name")
+    emit_line("time absolute")
+    emit_line("repeat off")
+    emit_line("preempt off")
+    emit_line("parammode live")
+
+    emit_line("preset Default _unused=0")
+    flush()
+
+
+# === Run loop ==============================================================
+
+def ckb_run():
+    keys = []
+    cmd, p1, _ = read_words()
+    while not (cmd == "begin" and p1 == "keymap"):
+        if not cmd: return -1
+        cmd, p1, _ = read_words()
+    cmd, _, _ = read_words()  # keycount
+    if cmd != "keycount": return -1
+    while True:
+        cmd, p1, p2 = read_words()
+        if cmd == "end" and p1 == "keymap":
+            break
+        if cmd == "key":
+            try:
+                xs, ys = p2.split(",")
+                keys.append({"name": p1, "x": int(xs), "y": int(ys)})
+            except ValueError:
+                continue
+
+    out = output_path()
+    write_error = None
+    try:
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        with open(out, "w") as f:
+            json.dump({"keys": keys}, f, indent=2)
+    except OSError as e:
+        write_error = e
+
+    cmd, p1, _ = read_words()
+    while not (cmd == "begin" and p1 == "params"):
+        if not cmd: return -1
+        cmd, p1, _ = read_words()
+    while True:
+        cmd, p1, _ = read_words()
+        if cmd == "end" and p1 == "params":
+            break
+
+    cmd, p1, _ = read_words()
+    while not (cmd == "begin" and p1 == "run"):
+        if not cmd: return -1
+        cmd, p1, _ = read_words()
+    emit_line("begin run")
+    flush()
+
+    # Captured: glow every key. Cyan = success, red = file write failed.
+    color = "ff800000" if write_error else "ff003344"
+    while True:
+        cmd, p1, _ = read_words()
+        if not cmd or (cmd == "end" and p1 == "run"):
+            break
+        if cmd == "frame":
+            emit_line("begin frame")
+            for k in keys:
+                emit_line("argb {} {}".format(k["name"], color))
+            emit_line("end frame")
+            flush()
+        elif cmd == "begin" and p1 == "params":
+            while True:
+                c2, p1b, _ = read_words()
+                if c2 == "end" and p1b == "params":
+                    break
+
+    emit_line("end run")
+    flush()
+    return 0
+
+
+def main():
+    if len(sys.argv) >= 2:
+        if sys.argv[1] == "--ckb-info":
+            ckb_info()
+            return 0
+        if sys.argv[1] == "--ckb-run":
+            return ckb_run()
+    sys.stderr.write("This program must be run from within ckb\n")
+    return -1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

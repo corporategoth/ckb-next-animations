@@ -32,11 +32,12 @@ Install:
   Brick Breaker does NOT need "Start with key press" -- it does not
   read keypresses.
 
-Numpad level counter:
+Numpad level counter (each completed tier key keeps its own tier color, so
+you can read the current tier at a glance regardless of which colors are which):
   * 1-9:  num1..num9 lit cumulatively in green (tier 0)
-  * 10-18: numlock lit + num1..num9 cumulating in yellow (tier 1)
-  * 19-27: numlock+numslash + num1..num9 cumulating in orange (tier 2)
-  * 28-36: numlock+numslash+numstar + num1..num9 in red (tier 3)
+  * 10-18: numlock(green) + num1..num9 cumulating in yellow (tier 1)
+  * 19-27: numlock(green) + numslash(yellow) + num1..num9 cumulating in orange (tier 2)
+  * 28-36: numlock(green) + numslash(yellow) + numstar(orange) + num1..num9 in red (tier 3)
   * 37+:  saturated red pulse
 
 Per-level scaling:
@@ -218,6 +219,25 @@ def ckb_info():
               "paddlewidth=6 levelspeed=0.08 chaos=0.10 aimstrength=0.60 "
               "dropchance=0.5 dropcooldown=25.0 paddlefriction=0.5 "
               "ballcolor=ffffffaa paddlecolor=ff00ffaa")
+
+    # Harness extras: opt-in declarations the test_visual.py harness reads
+    # from --ckb-info to know which non-standard controls to expose. Plain
+    # ckb-next ignores any line it doesn't recognize, so this is safe in
+    # both contexts.
+    #
+    # `harness FEATURE k=v ...`             - singleton features
+    # `harness param NAME k=v ...`          - hidden tunables (the harness
+    #     adds them to its in-app param panel; the value `auto` means
+    #     "let the animation decide", anything else is a forced override)
+    emit_line("harness speed default=5.0 min=0.05 max=200.0")
+    emit_line("harness param ai_skill type=double default=auto min=0.0 max=1.0 "
+              "label=" + url_encode("AI skill (0=dumb..1=smart)"))
+    emit_line("harness param ai_paddle_mult type=double default=auto min=0.4 max=3.0 "
+              "label=" + url_encode("Paddle speed mult"))
+    emit_line("harness param ai_pred_error type=double default=auto min=0.2 max=5.0 "
+              "label=" + url_encode("Prediction error mult"))
+    emit_line("harness param ai_aim_mult type=double default=auto min=0.3 max=1.0 "
+              "label=" + url_encode("Aim strength mult"))
     flush()
 
 
@@ -452,6 +472,15 @@ class Game:
         self._paddle_speed_mult = 1.0
         self._prediction_error_mult = 1.0
         self._aim_strength_mult = 1.0
+
+        # Harness-tunable AI overrides. `None` means "let the roll decide";
+        # any float forces that specific value (within the declared range)
+        # for every game start until cleared. Set via the standard param
+        # mechanism by the test harness.
+        self._ai_skill_override = None
+        self._paddle_speed_mult_override = None
+        self._prediction_error_mult_override = None
+        self._aim_strength_mult_override = None
 
         # Parameters
         self.base_speed = 60.0
@@ -688,8 +717,40 @@ class Game:
                 self.ball_argb = _parse_argb(value)
             elif name == "paddlecolor":
                 self.paddle_argb = _parse_argb(value)
+            elif name in ("ai_skill", "ai_paddle_mult",
+                          "ai_pred_error", "ai_aim_mult"):
+                # Harness-tunable AI overrides. The literal "auto" (or any
+                # non-numeric) clears the override and lets the next roll
+                # randomize as usual; a numeric value clamps into the
+                # declared range and forces every subsequent game.
+                self._set_ai_override(name, value)
         except (ValueError, TypeError):
             pass
+
+    def _set_ai_override(self, name, value):
+        if str(value).strip().lower() == "auto":
+            override = None
+        else:
+            try:
+                override = float(value)
+            except (ValueError, TypeError):
+                return
+        if name == "ai_skill":
+            self._ai_skill_override = (
+                None if override is None else max(0.0, min(1.0, override)))
+        elif name == "ai_paddle_mult":
+            self._paddle_speed_mult_override = (
+                None if override is None else max(0.4, min(3.0, override)))
+        elif name == "ai_pred_error":
+            self._prediction_error_mult_override = (
+                None if override is None else max(0.2, min(5.0, override)))
+        elif name == "ai_aim_mult":
+            self._aim_strength_mult_override = (
+                None if override is None else max(0.3, min(1.0, override)))
+        # Apply the change immediately so a harness user tweaking the
+        # slider sees the AI behavior shift in the current game, not on
+        # the next death-and-restart.
+        self._roll_ai_skill()
 
     def keypress(self, name, down):
         if not down:
@@ -823,11 +884,28 @@ class Game:
           aim_strength_mult: 0.3x .. 1.0x -- terrible AI barely aims
               (mostly just blocks), top-tier AI uses full aim
         """
-        skill = random.betavariate(3.0, 3.0)
+        # Either honour an explicit harness override or roll fresh.
+        if self._ai_skill_override is not None:
+            skill = self._ai_skill_override
+        else:
+            skill = random.betavariate(3.0, 3.0)
         self._ai_skill = skill
-        self._paddle_speed_mult = 0.4 + skill * 2.6
-        self._prediction_error_mult = 5.0 - skill * 4.8
-        self._aim_strength_mult = 0.3 + skill * 0.7
+
+        # Each multiplier is independently overridable: forcing skill to
+        # 0.9 but leaving paddle_mult on auto gives a smart-aiming AI with
+        # a randomly-rolled paddle speed, etc.
+        self._paddle_speed_mult = (
+            self._paddle_speed_mult_override
+            if self._paddle_speed_mult_override is not None
+            else 0.4 + skill * 2.6)
+        self._prediction_error_mult = (
+            self._prediction_error_mult_override
+            if self._prediction_error_mult_override is not None
+            else 5.0 - skill * 4.8)
+        self._aim_strength_mult = (
+            self._aim_strength_mult_override
+            if self._aim_strength_mult_override is not None
+            else 0.3 + skill * 0.7)
         # Log to stderr (visible in daemon log if debug enabled) and to
         # the debug file. Helps gauge whether each restart is actually
         # rolling distinct stats.
@@ -1449,12 +1527,16 @@ class Game:
 
         r, g, b = TIER_COLORS[tier]
 
+        # Each completed tier's "tier key" keeps that tier's own color, so the
+        # numbers' current color (= current tier) is always visually distinct
+        # from the completed tiers.
         for t_idx in range(tier):
-            if t_idx < len(self.numpad_tier_indices):
+            if t_idx < len(self.numpad_tier_indices) and t_idx < len(TIER_COLORS):
+                tr, tg, tb = TIER_COLORS[t_idx]
                 k_idx = self.numpad_tier_indices[t_idx]
                 if k_idx < len(self.keys):
                     k = self.keys[k_idx]
-                    k.a, k.r, k.g, k.b = 255, r, g, b
+                    k.a, k.r, k.g, k.b = 255, tr, tg, tb
 
         for n_idx in range(within_tier):
             if n_idx < len(self.numpad_number_indices):

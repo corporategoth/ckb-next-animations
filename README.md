@@ -114,6 +114,112 @@ levels).
 - `ballcolor` — ARGB color of the ball (default `ffffffff`, white)
 - `paddlecolor` — ARGB color of the paddle (default `ff00ffff`, cyan)
 
+### Visual testing without ckb-next
+
+`tools/test_visual.py` is a generic offline runner for any ckb-next
+animation. It speaks the standard `--ckb-info` / `--ckb-run` plugin
+protocol — the same one the daemon speaks — so it works against
+brickbreaker, against the bundled compiled animations in
+`/usr/lib/ckb-next-animations/`, and against any third-party animation
+that follows the ckb-next plugin contract. Output renders to a pygame
+window over the layout you captured. Pygame is only a **test**
+dependency — the animations themselves remain pure stdlib.
+
+One-time keymap capture (so the harness draws a layout that matches
+your real keyboard):
+
+```bash
+cp tools/dump_keymap ~/.local/share/ckb-next/animations/
+chmod +x ~/.local/share/ckb-next/animations/dump_keymap
+```
+
+Then in ckb-next: **Settings → Animation Scripts → Re-scan**, apply
+the **Capture Keymap** animation once (every key glows soft cyan to
+confirm). It writes to `~/.cache/ckb-next/keymap.json`. Switch back to
+your normal animation when done.
+
+Set up the test virtualenv:
+
+```bash
+uv sync   # creates .venv with pygame
+```
+
+The animation to run is the only required CLI argument. Bare names are
+resolved against `/usr/lib/ckb-next-animations/` and
+`~/.local/share/ckb-next/animations/`; absolute or relative paths work
+too. Everything else (params, presets, speed) is configured live in
+the window.
+
+```bash
+uv run tools/test_visual.py brickbreaker
+uv run tools/test_visual.py random
+uv run tools/test_visual.py /path/to/some/animation
+uv run tools/test_visual.py wave --list-params
+```
+
+Set your keyboard's idle ("always-on") color once with `--base R,G,B`
+(or `--base RRGGBB`); it's persisted to
+`~/.cache/ckb-next/test_visual.json` and used as the composite
+background for every subsequent run. Animations that emit alpha-blended
+colors (e.g. medical-monitor's ECG trace at partial alpha) will blend
+over it the same way the real ckb-next daemon does, so what you see in
+the window matches what would land on the keyboard.
+
+```bash
+uv run tools/test_visual.py brickbreaker --base 0,85,0   # set & remember
+uv run tools/test_visual.py medical-monitor              # uses the saved value
+```
+
+Live controls:
+
+| Key / Action       | Effect                                              |
+| ------------------ | --------------------------------------------------- |
+| `tab`              | toggle the param panel                              |
+| `space`            | pause / resume                                      |
+| `r`                | restart the animation                               |
+| `q` / `Esc`        | quit (or close the panel if it's open)              |
+| **mouse click**    | toggle **interactive mode** — every key is then forwarded to the animation as `key NAME down/up`, so animations that respond to typing (medical-monitor, heat, ripple) actually respond. Click again to exit. None of the harness shortcuts work while interactive — that's the whole point. |
+
+In the param panel:
+
+| Key          | Action                                            |
+| ------------ | ------------------------------------------------- |
+| `↑` / `↓`    | select row                                        |
+| `←` / `→`    | adjust the selected param  /  cycle the preset row |
+| `enter`      | enter text-edit mode  /  apply the selected preset |
+| `del`        | reset a hidden (•) param to `auto`                |
+
+When the animation declares it (see below), `+` / `-` scrub the speed
+multiplier and `1` resets it to the declared default.
+
+#### Harness extras (animation opt-in)
+
+The harness recognises non-standard `harness …` lines in `--ckb-info`
+that let an animation declare which extra interactive controls it
+supports. The real ckb-next daemon ignores any line it doesn't know,
+so the declaration is a no-op under production use.
+
+| Form                                              | Effect                                      |
+| ------------------------------------------------- | ------------------------------------------- |
+| `harness speed default=N min=N max=N`             | Animation is self-paced; harness exposes `+` / `-` / `1` to scrub the wall→animation time multiplier. |
+| `harness param NAME type=TYPE default=auto min=N max=N label=...` | Hidden tunable. Shown alongside the regular params in the in-app panel (marked with a leading `•`); accepts the literal `auto` to mean "let the animation decide" and any other value to force a specific override. The harness sends changes back through the standard `param NAME VALUE` protocol, so the animation just handles them in its existing param dispatch. |
+
+Brickbreaker declares `harness speed default=5.0 …`, so the panel
+opens with speed at 5× and `+` / `-` are live. It also declares
+`harness param ai_skill …`, `ai_paddle_mult`, `ai_pred_error`, and
+`ai_aim_mult` — set any of those to a number to force a specific AI
+character (e.g. `ai_skill=0.95` for a brilliant player), or leave
+them on `auto` to keep the per-game Beta(3,3) randomization. Changes
+take effect immediately on the running game (no restart needed).
+
+#### Live vs. static params
+
+Animations declaring `parammode live` (brickbreaker and almost all of
+the bundled ckb-next animations) accept param changes mid-run, so
+edits in the panel apply instantly. For the rare `parammode static`
+animation, edits are queued locally and take effect on the next `r`
+restart.
+
 ---
 
 ## Medical Monitor

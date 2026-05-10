@@ -5,3 +5,7 @@ __pycache__/
 # Local Claude Code settings and session state
 .claude/
 .remember/
+
+# uv virtualenv (test/dev only; the animations themselves are stdlib)
+.venv/
+.python-version

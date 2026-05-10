@@ -1,0 +1,14 @@
+[project]
+name = "ckb-next-animations"
+version = "0.1.0"
+description = "ckb-next animations and offline visual test harness."
+requires-python = ">=3.10"
+dependencies = []
+
+[dependency-groups]
+# pygame-ce (community edition) is a drop-in replacement for pygame and
+# is actively maintained against current Python; upstream pygame 2.6.1's
+# font bindings are broken on Python 3.14.
+dev = [
+    "pygame-ce>=2.5",
+]
