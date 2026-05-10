@@ -1,0 +1,832 @@
+#!/usr/bin/env python3
+"""
+snake - Native ckb-next animation.
+
+A self-playing classic snake. The snake spawns small in the middle of
+the keyboard, hunts down dots that appear in unoccupied cells, grows
+each time it eats one, and speeds up the longer it gets. It dies if it
+runs into its own body or off the edge of its playfield. After death it
+respawns small.
+
+Copyright (c) 2026 Preston A. Elder <prez@neuromancy.net>.
+Licensed under the MIT License -- see the LICENSE file in the project
+repository for the full text.
+
+Designed and refined by Preston A. Elder <prez@neuromancy.net>.
+Code authored by Claude AI under Preston's direction.
+
+Tested on a Corsair K70. Other ckb-next-supported keyboards should work
+but key layouts may differ.
+
+Install:
+  Drop this file (executable) into your user-local ckb-next animations
+  directory, then have the GUI re-scan its scripts. No sudo, no daemon
+  restart, no GUI restart needed:
+
+    mkdir -p ~/.local/share/ckb-next/animations
+    cp snake ~/.local/share/ckb-next/animations/
+    chmod +x ~/.local/share/ckb-next/animations/snake
+
+  Then in ckb-next: Settings -> Animation Scripts -> Re-scan. The
+  animation appears in the Lighting tab as "Snake".
+
+  In Properties -> Settings -> Playback enable "Start with mode" so the
+  animation runs whenever the mode is active. Snake does NOT use key
+  presses (kpmode none) -- the snake plays itself.
+
+How the playfield is built:
+  The keyboard isn't a perfect grid, so we infer a 4-connected
+  adjacency at start time: for each key we find the nearest neighbor in
+  N/S/E/W within a tolerance derived from the median key spacing. The
+  snake is then confined to whichever connected component it spawned in
+  -- normally the main typing block, since that's the largest.
+
+AI strategy:
+  * BFS from the head to the nearest reachable dot, treating mid-body
+    cells as obstacles (the tail is passable since it leaves the cell
+    on the next move). The first step on the shortest path becomes the
+    chosen direction.
+  * If no dot is reachable, the snake picks the legal move that
+    maximizes reachable empty space (flood fill) -- a cheap way to
+    avoid trapping itself in a pocket of body.
+  * If no legal move exists, the snake dies.
+
+Speedup as it grows:
+  Move period shrinks linearly with length, floored at min_period:
+    period = max(min_period, base_period - growth_speedup * (length - 1))
+  So a default-tuned snake at length 1 moves every 0.35s; by length
+  30 it's down to ~0.21s; by length 59 it hits the 0.06s floor. Tune
+  growth_speedup=0 to disable speedup entirely.
+
+Parameters (all tunable in the ckb-next GUI):
+  base_period     Seconds per move when the snake is at its initial
+                  length (default 0.35, range 0.05-2.0)
+  min_period      Floor on move period; protects from unplayable speeds
+                  at very long lengths (default 0.06, range 0.02-1.0)
+  growth_speedup  Seconds shaved off the move period per added segment
+                  (default 0.005, range 0.0-0.05; 0.0 disables speedup)
+  initial_length  Length the snake spawns (and respawns) at
+                  (default 3, range 1-10)
+  dot_ttl         Seconds a dot stays on the board before vanishing
+                  (default 8.0, range 1.0-60.0)
+  dot_interval    Seconds between dot-spawn attempts
+                  (default 2.5, range 0.2-30.0)
+  max_dots        Cap on simultaneous dots
+                  (default 3, range 1-10)
+  head_color      ARGB color of the snake's head
+                  (default ffe0ffe0, pale green-white)
+  body_color      ARGB color of the body; tail end fades toward black
+                  (default ff00c800, solid green)
+  dot_color       ARGB color of dots; dots blink in the last 1.5s of
+                  their TTL (default ffff2030, red)
+"""
+import sys
+import math
+import random
+from collections import deque
+
+
+# === Protocol helpers ======================================================
+
+def _need_encode(c):
+    o = ord(c)
+    return (o <= 0x2C or o == 0x2F or 0x3A <= o <= 0x40
+            or o == 0x5B or o == 0x5D or o >= 0x7F)
+
+
+def url_encode(s):
+    out = []
+    for c in s:
+        if _need_encode(c):
+            out.append("%{:02X}".format(ord(c)))
+        else:
+            out.append(c)
+    return "".join(out)
+
+
+def url_decode(s):
+    out, i = [], 0
+    while i < len(s):
+        if s[i] == "%" and i + 2 < len(s):
+            try:
+                out.append(chr(int(s[i + 1:i + 3], 16)))
+                i += 3
+                continue
+            except ValueError:
+                pass
+        out.append(s[i])
+        i += 1
+    return "".join(out)
+
+
+def read_words():
+    line = sys.stdin.readline()
+    if not line:
+        return ("", "", "")
+    parts = line.strip().split(None, 2)
+    while len(parts) < 3:
+        parts.append("")
+    return (url_decode(parts[0]), url_decode(parts[1]), url_decode(parts[2]))
+
+
+def emit(s): sys.stdout.write(s)
+def emit_line(s): sys.stdout.write(s + "\n")
+def flush(): sys.stdout.flush()
+
+
+# === Plugin info ===========================================================
+
+def ckb_info():
+    emit("guid "); emit(url_encode("{F4D72A11-3E58-4F2B-B19D-7C4A2F8E5D31}")); emit_line("")
+    emit("name "); emit(url_encode("Snake")); emit_line("")
+    emit("version "); emit(url_encode("1.0")); emit_line("")
+    emit_line("year 2026")
+    emit("author "); emit(url_encode("Preston A. Elder <prez@neuromancy.net>")); emit_line("")
+    emit("license "); emit(url_encode("MIT")); emit_line("")
+    emit("description "); emit(url_encode(
+        "Self-playing classic snake. Hunts dots, grows on each catch, "
+        "speeds up as it grows, dies on self- or edge-collision, then "
+        "respawns small.")); emit_line("")
+
+    emit("param double base_period "); emit(url_encode("Base move period:"))
+    emit(" "); emit(url_encode("seconds")); emit_line(" 0.35 0.05 2.0")
+    emit("param double min_period "); emit(url_encode("Minimum move period:"))
+    emit(" "); emit(url_encode("seconds")); emit_line(" 0.06 0.02 1.0")
+    emit("param double growth_speedup "); emit(url_encode("Speedup per segment:"))
+    emit(" "); emit(url_encode("seconds")); emit_line(" 0.005 0.0 0.05")
+    emit("param long initial_length "); emit(url_encode("Initial length:"))
+    emit(" "); emit(url_encode("segments")); emit_line(" 3 1 10")
+    emit("param double dot_ttl "); emit(url_encode("Dot lifetime:"))
+    emit(" "); emit(url_encode("seconds")); emit_line(" 8.0 1.0 60.0")
+    emit("param double dot_interval "); emit(url_encode("Dot spawn interval:"))
+    emit(" "); emit(url_encode("seconds")); emit_line(" 2.5 0.2 30.0")
+    emit("param long max_dots "); emit(url_encode("Max simultaneous dots:"))
+    emit(" "); emit(url_encode("")); emit_line(" 3 1 10")
+    emit("param argb head_color "); emit(url_encode("Head color:"))
+    emit(" "); emit(url_encode("")); emit_line(" ffe0ffe0")
+    emit("param argb body_color "); emit(url_encode("Body color:"))
+    emit(" "); emit(url_encode("")); emit_line(" ff00c800")
+    emit("param argb dot_color "); emit(url_encode("Dot color:"))
+    emit(" "); emit(url_encode("")); emit_line(" ffff2030")
+
+    emit_line("kpmode none")
+    emit_line("time absolute")
+    emit_line("repeat off")
+    emit_line("preempt off")
+    emit_line("parammode live")
+
+    emit_line("preset Default")
+    emit("preset "); emit(url_encode("Slow & long-lived"))
+    emit_line(" base_period=0.30 growth_speedup=0.002 dot_ttl=15.0 dot_interval=4.0")
+    emit("preset "); emit(url_encode("Frantic"))
+    emit_line(" base_period=0.10 growth_speedup=0.003 dot_ttl=4.0 dot_interval=1.0 max_dots=5")
+
+    # Harness extras: opt-in declarations the test_visual.py harness reads
+    # from --ckb-info to know which non-standard controls to expose. The
+    # standard ckb-next loader ignores unknown lines, so they're harmless
+    # under the real daemon.
+    emit_line("harness speed default=1.0 min=0.1 max=20.0")
+
+    flush()
+
+
+# === Game ==================================================================
+
+# Direction encoding. The order matters in a couple of places below
+# (DIRS gets shuffled when iterating to break tie-breaks evenly).
+N, S, E, W = 0, 1, 2, 3
+DIRS = (N, S, E, W)
+DIR_OPP = {N: S, S: N, E: W, W: E}
+
+
+def _argb_pack_hex(hex_str):
+    """'ffaabbcc' -> (a, r, g, b) ints. Caller is responsible for
+    handling malformed input -- we just default to opaque white."""
+    try:
+        s = hex_str.lower()
+        if len(s) != 8:
+            raise ValueError
+        return (int(s[0:2], 16), int(s[2:4], 16),
+                int(s[4:6], 16), int(s[6:8], 16))
+    except (TypeError, ValueError):
+        return (255, 255, 255, 255)
+
+
+class Key:
+    __slots__ = ("name", "x", "y", "a", "r", "g", "b")
+
+    def __init__(self, name, x, y):
+        self.name = name
+        self.x = x
+        self.y = y
+        self.a = 0
+        self.r = 0
+        self.g = 0
+        self.b = 0
+
+
+def _typical_steps(keys):
+    """Median horizontal/vertical step between neighboring keys.
+
+    For sx (typical width) we want pairs that are clearly same-row: in
+    ckb keymaps the y values within a row are identical, so requiring
+    |dy| ~= 0 (within a tight bootstrap tolerance) isolates true
+    horizontal neighbors. Same logic for sy with |dx| ~= 0.
+
+    The bootstrap tolerance is sized off the keyboard's bounding box,
+    assuming a typical board is around 6 rows tall and 18 columns
+    wide. Half of one cell in each axis is well below the actual row /
+    column step on every real keyboard but well above the within-row
+    y jitter (which is essentially 0 in ckb keymaps)."""
+    n = len(keys)
+    if n < 2:
+        return 12, 12
+    xs = [k.x for k in keys]
+    ys = [k.y for k in keys]
+    x_range = max(xs) - min(xs)
+    y_range = max(ys) - min(ys)
+    # Half-cell bootstrap tolerance. Big enough to absorb any noise in
+    # the keymap, small enough to never cross into a different row/col.
+    bx = max(1, x_range // 36)  # half a cell at 18 cols
+    by = max(1, y_range // 12)  # half a cell at 6 rows
+
+    nearest_dx = []
+    nearest_dy = []
+    for i, k in enumerate(keys):
+        min_dx = None
+        min_dy = None
+        for j in range(n):
+            if j == i:
+                continue
+            k2 = keys[j]
+            dx = k2.x - k.x
+            dy = k2.y - k.y
+            if dx > 0 and abs(dy) <= by:
+                if min_dx is None or dx < min_dx:
+                    min_dx = dx
+            if dy > 0 and abs(dx) <= bx:
+                if min_dy is None or dy < min_dy:
+                    min_dy = dy
+        if min_dx is not None:
+            nearest_dx.append(min_dx)
+        if min_dy is not None:
+            nearest_dy.append(min_dy)
+
+    def _median(vals, default):
+        if not vals:
+            return default
+        s = sorted(vals)
+        return s[len(s) // 2]
+
+    return _median(nearest_dx, 12), _median(nearest_dy, 12)
+
+
+def _build_adjacency(keys):
+    """Returns adj[idx] = [N, S, E, W] neighbor indices (-1 if none).
+
+    Heuristic: for each key, the neighbor in a direction is the closest
+    other key whose displacement is dominated by that direction (we
+    require the perpendicular axis to be within a tolerance derived
+    from typical key spacing). This naturally keeps the snake inside
+    one section of the keyboard -- crossing a wide gap (e.g. typing
+    block to numpad) needs a key bridging it, which doesn't exist."""
+    n = len(keys)
+    adj = [[-1, -1, -1, -1] for _ in range(n)]
+    if n < 2:
+        return adj
+
+    sx, sy = _typical_steps(keys)
+
+    # Tolerances on the perpendicular axis. Staggered rows (the qwerty
+    # row offset half a key from the asdf row) mean the "south"
+    # neighbor of `q` (qwerty) is `a` (asdf), which sits at a non-zero
+    # dx -- so we need at least a half-key of horizontal slack. The
+    # vertical slack is tighter so keys in the same row stay together.
+    tol_x = sx * 0.75
+    tol_y = sy * 0.5
+    # Cap on the dominant-axis distance: reject neighbors more than
+    # two typical steps away so a missing key never bridges a section
+    # gap (typing block -> numpad, function row -> number row split).
+    max_dx = sx * 2.5
+    max_dy = sy * 2.5
+
+    inf = (1 << 62, 1 << 62)
+    for i, k in enumerate(keys):
+        best = [None, None, None, None]
+        # Score is (primary_distance, perpendicular_distance) so ties
+        # on the dominant axis (a→q vs a→w both have dy=-12) get
+        # broken by alignment (q has dx=0, w has dx=9 → prefer q).
+        best_score = [inf, inf, inf, inf]
+        for j in range(n):
+            if j == i:
+                continue
+            k2 = keys[j]
+            dx = k2.x - k.x
+            dy = k2.y - k.y
+            adx, ady = abs(dx), abs(dy)
+            # E / W (dx-dominated, perpendicular axis = y)
+            if ady <= tol_y:
+                if 0 < dx <= max_dx:
+                    s = (dx, ady)
+                    if s < best_score[E]:
+                        best_score[E] = s
+                        best[E] = j
+                elif 0 < -dx <= max_dx:
+                    s = (-dx, ady)
+                    if s < best_score[W]:
+                        best_score[W] = s
+                        best[W] = j
+            # N / S (dy-dominated, perpendicular axis = x)
+            if adx <= tol_x:
+                if 0 < dy <= max_dy:
+                    s = (dy, adx)
+                    if s < best_score[S]:
+                        best_score[S] = s
+                        best[S] = j
+                elif 0 < -dy <= max_dy:
+                    s = (-dy, adx)
+                    if s < best_score[N]:
+                        best_score[N] = s
+                        best[N] = j
+        for d in DIRS:
+            if best[d] is not None:
+                adj[i][d] = best[d]
+    return adj
+
+
+def _connected_components(n, adj):
+    """Returns a list of lists of key indices, one per connected
+    component of the adjacency graph. Used to find the largest
+    contiguous playfield to confine the snake to."""
+    seen = [False] * n
+    comps = []
+    for start in range(n):
+        if seen[start]:
+            continue
+        comp = []
+        queue = [start]
+        seen[start] = True
+        while queue:
+            node = queue.pop()
+            comp.append(node)
+            for d in DIRS:
+                nxt = adj[node][d]
+                if nxt >= 0 and not seen[nxt]:
+                    seen[nxt] = True
+                    queue.append(nxt)
+        comps.append(comp)
+    return comps
+
+
+class Game:
+    """Self-playing snake game. The render() routine writes ARGB into
+    each Key directly; the protocol loop in ckb_run() emits them."""
+
+    def __init__(self):
+        self.keys = []
+        self.keys_by_name = {}
+        self.adj = []
+        self.playfield = []  # subset of key indices the snake plays in
+        self.playfield_set = frozenset()
+
+        # Tunable params (defaults match ckb_info declarations).
+        self.base_period = 0.35
+        self.min_period = 0.06
+        self.growth_speedup = 0.005
+        self.initial_length = 3
+        self.dot_ttl = 8.0
+        self.dot_interval = 2.5
+        self.max_dots = 3
+        self.head_argb = (255, 224, 255, 224)
+        self.body_argb = (255, 0, 200, 0)
+        self.dot_argb = (255, 255, 32, 48)
+
+        # Runtime state.
+        self.snake = []          # list of key indices, head at [0]
+        self.direction = E
+        self.dots = {}           # key_idx -> remaining ttl seconds
+        self.move_timer = 0.0
+        self.dot_spawn_timer = 0.0
+        self.t = 0.0             # wall time since init
+        self.state = "play"      # "play" | "dying" | "spawning"
+        self.death_timer = 0.0
+        self.death_duration = 1.5
+        self.spawn_timer = 0.0
+        self.spawn_duration = 0.4
+
+    # -- Setup -----------------------------------------------------------
+
+    def init(self):
+        if not self.keys:
+            return
+        self.keys_by_name = {k.name: i for i, k in enumerate(self.keys)}
+        self.adj = _build_adjacency(self.keys)
+        comps = _connected_components(len(self.keys), self.adj)
+        # Largest connected component is the playfield. Anything outside
+        # it (numpad, media keys, lone islands) stays dark.
+        comps.sort(key=len, reverse=True)
+        self.playfield = comps[0] if comps else []
+        self.playfield_set = frozenset(self.playfield)
+        self._spawn_snake()
+
+    # -- Param dispatch -------------------------------------------------
+
+    def set_param(self, name, value):
+        try:
+            if name == "base_period":
+                self.base_period = max(0.05, min(2.0, float(value)))
+            elif name == "min_period":
+                self.min_period = max(0.02, min(1.0, float(value)))
+            elif name == "growth_speedup":
+                self.growth_speedup = max(0.0, min(0.05, float(value)))
+            elif name == "initial_length":
+                self.initial_length = max(1, min(10, int(value)))
+            elif name == "dot_ttl":
+                self.dot_ttl = max(1.0, min(60.0, float(value)))
+            elif name == "dot_interval":
+                self.dot_interval = max(0.2, min(30.0, float(value)))
+            elif name == "max_dots":
+                self.max_dots = max(1, min(10, int(value)))
+            elif name == "head_color":
+                self.head_argb = _argb_pack_hex(value)
+            elif name == "body_color":
+                self.body_argb = _argb_pack_hex(value)
+            elif name == "dot_color":
+                self.dot_argb = _argb_pack_hex(value)
+        except (ValueError, TypeError):
+            pass
+
+    # -- Spawn / respawn ------------------------------------------------
+
+    def _spawn_snake(self):
+        """Place the snake in the middle of the playfield with the
+        configured initial length, tail extending opposite of a random
+        starting direction (so the head has room to advance)."""
+        if not self.playfield:
+            self.snake = []
+            return
+        # Pick the most-central key by squared distance from the
+        # playfield's centroid; gives the snake the most room to wander.
+        cx = sum(self.keys[i].x for i in self.playfield) / len(self.playfield)
+        cy = sum(self.keys[i].y for i in self.playfield) / len(self.playfield)
+        center = min(self.playfield,
+                     key=lambda i: (self.keys[i].x - cx) ** 2
+                                   + (self.keys[i].y - cy) ** 2)
+        # Try directions in random order so the spawn isn't always east.
+        # We require the chosen direction to have at least 1 valid
+        # forward-neighbor and `initial_length-1` valid backward-neighbors
+        # (so the body can extend without running off the edge).
+        dirs = list(DIRS)
+        random.shuffle(dirs)
+        for head_dir in dirs:
+            forward = self.adj[center][head_dir]
+            if forward < 0:
+                continue
+            back_dir = DIR_OPP[head_dir]
+            body = [center]
+            ok = True
+            cur = center
+            for _ in range(self.initial_length - 1):
+                nxt = self.adj[cur][back_dir]
+                if nxt < 0 or nxt in body:
+                    ok = False
+                    break
+                body.append(nxt)
+                cur = nxt
+            if ok:
+                self.snake = body
+                self.direction = head_dir
+                break
+        else:
+            # Couldn't fit even the initial length anywhere; fall back to
+            # whatever single cell we picked. (Pathological -- only a
+            # tiny playfield would trigger it.)
+            self.snake = [center]
+            self.direction = E
+        self.dots = {}
+        self.dot_spawn_timer = 0.0
+        self.move_timer = 0.0
+        self.state = "spawning"
+        self.spawn_timer = 0.0
+
+    def _spawn_dot(self):
+        if len(self.dots) >= self.max_dots:
+            return
+        snake_set = set(self.snake)
+        free = [i for i in self.playfield
+                if i not in snake_set and i not in self.dots]
+        if not free:
+            return
+        idx = random.choice(free)
+        self.dots[idx] = self.dot_ttl
+
+    # -- Tick -----------------------------------------------------------
+
+    def advance(self, dt):
+        self.t += dt
+        if self.state == "dying":
+            self.death_timer -= dt
+            if self.death_timer <= 0:
+                self._spawn_snake()
+            return
+        if self.state == "spawning":
+            self.spawn_timer += dt
+            if self.spawn_timer >= self.spawn_duration:
+                self.state = "play"
+            return
+        # Decay dots, drop expired ones.
+        for idx in list(self.dots.keys()):
+            self.dots[idx] -= dt
+            if self.dots[idx] <= 0:
+                del self.dots[idx]
+        # Spawn dots on a fixed cadence.
+        self.dot_spawn_timer += dt
+        if self.dot_spawn_timer >= self.dot_interval:
+            self.dot_spawn_timer = 0.0
+            self._spawn_dot()
+        # Move snake on its own cadence; growth-driven speedup is
+        # applied here so eating a dot makes the *next* move faster.
+        self.move_timer += dt
+        period = self._move_period()
+        # Allow multiple moves per advance() if we're badly behind --
+        # protects against frame-skip stutter at very high speed.
+        moves = 0
+        while self.move_timer >= period and moves < 5 and self.state == "play":
+            self.move_timer -= period
+            self._move_snake()
+            moves += 1
+            period = self._move_period()
+
+    def _move_period(self):
+        # Length-driven speedup, floored at min_period so the game stays
+        # readable. `length - 1` so a 1-segment snake hits base_period.
+        length = max(1, len(self.snake))
+        p = self.base_period - self.growth_speedup * (length - 1)
+        return max(self.min_period, p)
+
+    def _move_snake(self):
+        """One step of snake motion: pick a direction, advance the head,
+        eat-or-shed-tail. Death is detected here when no legal move
+        exists (or the chosen step lands on a body cell or an edge)."""
+        head = self.snake[0]
+        # Mid-body cells block movement. The tail is passable because it
+        # leaves the cell on this same step (unless we're about to grow,
+        # which only happens if the head lands on a dot -- handled below).
+        body_set = set(self.snake[:-1])
+
+        direction = self._ai_choose_direction(head, body_set)
+        if direction is None:
+            self._die()
+            return
+
+        nxt = self.adj[head][direction]
+        if nxt < 0 or nxt in body_set:
+            self._die()
+            return
+
+        eating = nxt in self.dots
+        self.snake.insert(0, nxt)
+        self.direction = direction
+        if eating:
+            del self.dots[nxt]
+            # Growth: keep the tail in place. Next iteration's body_set
+            # will treat the new tail correctly.
+        else:
+            self.snake.pop()
+
+    def _die(self):
+        self.state = "dying"
+        self.death_timer = self.death_duration
+
+    # -- AI --------------------------------------------------------------
+
+    def _ai_choose_direction(self, head, body_set):
+        """Returns one of N/S/E/W, or None if the snake has no legal
+        move (and should die). Strategy:
+          1. BFS from head to nearest dot, treating body[:-1] as
+             obstacles. Return the first step on the shortest path.
+          2. If no dot is reachable, pick the legal move that opens
+             the most reachable empty space (flood fill), so the snake
+             prefers wandering toward open territory rather than
+             pocketing itself.
+          3. If no move is legal at all, return None."""
+        d = self._bfs_to_dot(head, body_set)
+        if d is not None:
+            return d
+        # No reachable dot -- pick safest legal move.
+        best_dir = None
+        best_space = -1
+        # Random tie-break order so identical scores don't always pick
+        # the same compass direction (less repetitive looping behaviour).
+        order = list(DIRS)
+        random.shuffle(order)
+        for direction in order:
+            nxt = self.adj[head][direction]
+            if nxt < 0 or nxt in body_set:
+                continue
+            space = self._flood_count(nxt, body_set | {head})
+            if space > best_space:
+                best_space = space
+                best_dir = direction
+        return best_dir
+
+    def _bfs_to_dot(self, head, body_set):
+        if not self.dots:
+            return None
+        # Seed the queue with each first-step move so we can carry the
+        # original direction along instead of reconstructing the path.
+        visited = {head}
+        queue = deque()
+        for direction in DIRS:
+            nxt = self.adj[head][direction]
+            if nxt < 0 or nxt in body_set:
+                continue
+            visited.add(nxt)
+            queue.append((nxt, direction))
+        while queue:
+            node, first_dir = queue.popleft()
+            if node in self.dots:
+                return first_dir
+            for direction in DIRS:
+                nxt = self.adj[node][direction]
+                if nxt < 0 or nxt in body_set or nxt in visited:
+                    continue
+                visited.add(nxt)
+                queue.append((nxt, first_dir))
+        return None
+
+    def _flood_count(self, start, blocked):
+        if start in blocked:
+            return 0
+        visited = {start}
+        stack = [start]
+        while stack:
+            node = stack.pop()
+            for direction in DIRS:
+                nxt = self.adj[node][direction]
+                if nxt < 0 or nxt in blocked or nxt in visited:
+                    continue
+                visited.add(nxt)
+                stack.append(nxt)
+        return len(visited)
+
+    # -- Render ----------------------------------------------------------
+
+    def render(self):
+        self._clear_keys()
+        if self.state == "dying":
+            # Red strobe over the snake's last position, fading toward
+            # black so it visually "dissolves" before respawn.
+            phase = self.death_timer / self.death_duration  # 1 -> 0
+            pulse = 0.5 + 0.5 * math.sin(self.t * 24.0)
+            level = int(255 * phase * (0.4 + 0.6 * pulse))
+            for idx in self.snake:
+                k = self.keys[idx]
+                k.a, k.r, k.g, k.b = 255, level, 0, 0
+            return
+
+        if self.state == "spawning":
+            # Quick green flash on the spawning snake before normal play
+            # takes over. Helps the eye track the respawn location.
+            phase = self.spawn_timer / self.spawn_duration
+            flash = int(255 * (1.0 - phase))
+            for idx in self.snake:
+                k = self.keys[idx]
+                k.a = 255
+                k.r = min(255, self.body_argb[1] + flash // 2)
+                k.g = min(255, self.body_argb[2] + flash // 2)
+                k.b = min(255, self.body_argb[3] + flash // 2)
+            return
+
+        # Snake body: fade from body color at head end toward black at
+        # tail end. The head itself is rendered separately so it pops.
+        n = len(self.snake)
+        for i, idx in enumerate(self.snake):
+            k = self.keys[idx]
+            if i == 0:
+                k.a, k.r, k.g, k.b = self.head_argb
+                continue
+            # Linear fade: body_color at i=1, ~25% body_color at i=n-1
+            tail_floor = 0.25
+            if n <= 2:
+                f = 1.0
+            else:
+                f = 1.0 - (1.0 - tail_floor) * ((i - 1) / (n - 2))
+            ba, br, bg, bb = self.body_argb
+            k.a = ba
+            k.r = int(br * f)
+            k.g = int(bg * f)
+            k.b = int(bb * f)
+
+        # Dots. Blink fast in the last 1.5s of TTL as a "hurry up" cue.
+        for idx, ttl in self.dots.items():
+            k = self.keys[idx]
+            if ttl < 1.5:
+                # ~6 Hz blink; off half the period so the dot really
+                # disappears rather than just dimming.
+                if (ttl * 6.0) % 1.0 < 0.5:
+                    k.a, k.r, k.g, k.b = self.dot_argb
+                # else: leave the cell dark (already cleared)
+            else:
+                k.a, k.r, k.g, k.b = self.dot_argb
+
+    def _clear_keys(self):
+        for k in self.keys:
+            k.a = k.r = k.g = k.b = 0
+
+
+# === Run loop ==============================================================
+
+def ckb_run():
+    game = Game()
+
+    cmd, p1, p2 = read_words()
+    while not (cmd == "begin" and p1 == "keymap"):
+        if not cmd:
+            return -1
+        cmd, p1, p2 = read_words()
+    cmd, p1, p2 = read_words()
+    if cmd != "keycount":
+        return -1
+    while True:
+        cmd, p1, p2 = read_words()
+        if cmd == "end" and p1 == "keymap":
+            break
+        if cmd == "key":
+            try:
+                xs, ys = p2.split(",")
+                game.keys.append(Key(p1, int(xs), int(ys)))
+            except ValueError:
+                continue
+
+    game.init()
+
+    cmd, p1, p2 = read_words()
+    while not (cmd == "begin" and p1 == "params"):
+        if not cmd:
+            return -1
+        cmd, p1, p2 = read_words()
+    while True:
+        cmd, p1, p2 = read_words()
+        if cmd == "end" and p1 == "params":
+            break
+        if cmd == "param":
+            game.set_param(p1, p2)
+
+    cmd, p1, p2 = read_words()
+    while not (cmd == "begin" and p1 == "run"):
+        if not cmd:
+            return -1
+        cmd, p1, p2 = read_words()
+    emit_line("begin run")
+    flush()
+
+    while True:
+        cmd, p1, p2 = read_words()
+        if not cmd or (cmd == "end" and p1 == "run"):
+            break
+        if cmd == "frame":
+            game.render()
+            emit_line("begin frame")
+            for k in game.keys:
+                emit_line("argb {} {:02x}{:02x}{:02x}{:02x}".format(
+                    k.name, k.a, k.r, k.g, k.b))
+            emit_line("end frame")
+            flush()
+        elif cmd == "time":
+            try:
+                dt = float(p1)
+            except ValueError:
+                dt = 0.0
+            game.advance(dt)
+        elif cmd == "begin" and p1 == "params":
+            while True:
+                c2, p1b, p2b = read_words()
+                if c2 == "end" and p1b == "params":
+                    break
+                if c2 == "param":
+                    game.set_param(p1b, p2b)
+        elif cmd in ("start", "stop", "key"):
+            # kpmode=none: keypresses aren't expected, and start/stop
+            # are state signals we don't need to react to (the game
+            # auto-runs from init).
+            pass
+
+    emit_line("end run")
+    flush()
+    return 0
+
+
+def main():
+    if len(sys.argv) >= 2:
+        if sys.argv[1] == "--ckb-info":
+            ckb_info()
+            return 0
+        if sys.argv[1] == "--ckb-run":
+            return ckb_run()
+    sys.stderr.write("This program must be run from within ckb\n")
+    return -1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
