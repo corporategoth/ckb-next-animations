@@ -1987,6 +1987,114 @@ def _validate_value(p, value):
 
 # === Main ==================================================================
 
+class FrameRecorder:
+    """Pipes the rendered pygame surface to an ffmpeg subprocess at a
+    user-specified framerate. The harness can render at 60 fps while
+    the recorder samples at, say, 15 fps for a manageable GIF; the
+    sampling is rate-locked to wall time, so animations recorded at a
+    lower rate look correct (no time dilation), just choppier.
+
+    Format is picked from the output filename extension. GIFs go
+    through palettegen+paletteuse for sane quality; mp4 and webm use
+    libx264 with a moderate CRF. ffmpeg's stderr is captured and only
+    surfaced if it exits non-zero, so the harness console stays clean
+    on success."""
+
+    def __init__(self, path, fps, size):
+        self.path = path
+        self.fps = fps
+        self.size = size  # (w, h)
+        self.frame_period = 1.0 / fps if fps > 0 else float("inf")
+        self.acc = 0.0
+        self.frames_written = 0
+        self.proc = None
+        self._stderr = []  # captured ffmpeg stderr lines
+
+    def start(self):
+        ext = os.path.splitext(self.path)[1].lower()
+        w, h = self.size
+        cmd = [
+            "ffmpeg", "-y", "-loglevel", "error",
+            "-f", "rawvideo",
+            "-pixel_format", "rgb24",
+            "-video_size", "{}x{}".format(w, h),
+            "-framerate", str(self.fps),
+            "-i", "-",
+        ]
+        if ext == ".gif":
+            # One-shot palette generation + application: yields gifs
+            # within an order of magnitude of gifski quality without a
+            # second tool. `stats_mode=full` reads every frame for the
+            # palette so motion-only colors aren't dropped.
+            cmd += ["-vf",
+                    "split[s0][s1];"
+                    "[s0]palettegen=stats_mode=full[p];"
+                    "[s1][p]paletteuse=dither=bayer:bayer_scale=5"]
+        else:
+            cmd += ["-c:v", "libx264", "-pix_fmt", "yuv420p",
+                    "-preset", "medium", "-crf", "20"]
+        cmd.append(self.path)
+        try:
+            self.proc = subprocess.Popen(
+                cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+        except FileNotFoundError:
+            raise RuntimeError(
+                "--record requires `ffmpeg` on PATH; install it and retry")
+
+    def maybe_capture(self, surface, dt):
+        """Advance the sampling accumulator and write a frame if the
+        next sample window has elapsed. Catches BrokenPipeError so a
+        crashed ffmpeg doesn't tear down the harness mid-recording —
+        the error surfaces on stop()."""
+        if self.proc is None or self.proc.poll() is not None:
+            return
+        self.acc += dt
+        if self.acc < self.frame_period:
+            return
+        # Drop, don't accumulate -- if the harness stalled, we want to
+        # match real wall time rather than emit a burst of duplicate
+        # frames after the stall.
+        self.acc = 0.0
+        try:
+            # pygame-ce 2.3+ renamed `tostring` to `tobytes`; keep a
+            # fallback so older pygame still works.
+            to_bytes = getattr(pygame.image, "tobytes",
+                               pygame.image.tostring)
+            self.proc.stdin.write(to_bytes(surface, "RGB"))
+            self.frames_written += 1
+        except BrokenPipeError:
+            pass
+
+    def stop(self):
+        if self.proc is None:
+            return
+        try:
+            self.proc.stdin.close()
+        except (BrokenPipeError, OSError):
+            pass
+        # Drain stderr so the encoder can exit cleanly.
+        try:
+            err = self.proc.stderr.read().decode("utf-8", errors="replace")
+        except Exception:
+            err = ""
+        rc = self.proc.wait()
+        if rc != 0:
+            sys.stderr.write(
+                "ffmpeg exited rc={} while writing {}\n".format(rc, self.path))
+            if err:
+                sys.stderr.write(err)
+        else:
+            try:
+                size_b = os.path.getsize(self.path)
+                size_str = "{:.1f} KB".format(size_b / 1024) if size_b < 1024 ** 2 \
+                    else "{:.2f} MB".format(size_b / (1024 ** 2))
+            except OSError:
+                size_str = "?"
+            sys.stderr.write(
+                "recorded {} ({} frames @ {} fps, {})\n".format(
+                    self.path, self.frames_written, self.fps, size_str))
+
+
 def _resolve_animation(arg):
     """Resolves a bare animation name against the standard ckb-next
     install dirs, so users can say `random` instead of a full path.
@@ -2029,6 +2137,23 @@ def main():
                          "window.")
     ap.add_argument("--window", default="1400x460",
                     help="window size as WxH (default 1400x460)")
+    ap.add_argument("--record", default=None, metavar="FILE",
+                    help="record the rendered output to FILE. Format is "
+                         "picked from the extension: .gif uses ffmpeg's "
+                         "palettegen filter, .mp4 / .webm use libx264. "
+                         "Requires ffmpeg on PATH.")
+    ap.add_argument("--record-fps", type=float, default=None,
+                    help="output framerate for --record (default: 15 for "
+                         "GIF, 60 for video). Independent of the harness's "
+                         "render rate.")
+    ap.add_argument("--record-duration", type=float, default=10.0,
+                    metavar="SECONDS",
+                    help="auto-stop recording after this many wall seconds "
+                         "(default 10). 0 disables the cap; recording then "
+                         "ends when you quit (Esc/q).")
+    ap.add_argument("--record-headless", action="store_true",
+                    help="don't open a window — render to an off-screen "
+                         "surface only. Useful for unattended captures.")
     args = ap.parse_args()
 
     exe = _resolve_animation(args.animation)
@@ -2079,6 +2204,12 @@ def main():
     keys = load_keymap(args.keymap)
     win_w, win_h = (int(x) for x in args.window.lower().split("x"))
 
+    # Headless recording uses SDL's dummy video backend so pygame can
+    # render to an off-screen Surface without any window opening. Must
+    # be set before pygame.init() / set_mode().
+    if args.record and args.record_headless:
+        os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
+
     pygame.init()
     # Standard typematic-repeat: 400ms delay, then a fresh KEYDOWN every
     # 40ms while the key is held. Lets ↑/↓ in the param panel, +/-
@@ -2091,6 +2222,24 @@ def main():
     clock = pygame.time.Clock()
     fonts = FontCache()
     hud_font = fonts.get(14)
+
+    recorder = None
+    if args.record:
+        ext = os.path.splitext(args.record)[1].lower()
+        record_fps = args.record_fps if args.record_fps is not None \
+            else (15.0 if ext == ".gif" else 60.0)
+        recorder = FrameRecorder(args.record, record_fps, (win_w, win_h))
+        try:
+            recorder.start()
+        except RuntimeError as e:
+            sys.stderr.write("{}\n".format(e))
+            return 2
+        sys.stderr.write(
+            "recording -> {} ({} fps{})\n".format(
+                args.record, record_fps,
+                "; auto-stop in {}s".format(args.record_duration)
+                if args.record_duration > 0 else "; no time limit"))
+    record_elapsed = 0.0
 
     default_w, default_h = compute_defaults(keys)
     layout = compute_cap_layout(keys, default_w, default_h)
@@ -2279,6 +2428,14 @@ def main():
 
         pygame.display.flip()
 
+        if recorder is not None:
+            recorder.maybe_capture(screen, wall_dt)
+            record_elapsed += wall_dt
+            if args.record_duration > 0 and record_elapsed >= args.record_duration:
+                running = False
+
+    if recorder is not None:
+        recorder.stop()
     anim.stop()
     pygame.quit()
     return 0

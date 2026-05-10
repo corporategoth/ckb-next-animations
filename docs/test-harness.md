@@ -48,6 +48,42 @@ uv run tools/test_visual.py /path/to/some/animation
 uv run tools/test_visual.py wave --list-params   # dump and exit
 ```
 
+## Recording (GIF / MP4 / WebM)
+
+The harness can pipe its rendered output straight to an `ffmpeg`
+subprocess for capture, so what you see in the window is exactly what
+gets saved — no compositor scaling, no window decorations, frame-rate
+locked to the animation. Requires `ffmpeg` on your PATH (no other
+Python deps).
+
+| Flag | Default | Notes |
+| --- | --- | --- |
+| `--record FILE` | (off) | Output path. Format picked from extension: `.gif`, `.mp4`, `.webm`. |
+| `--record-fps N` | 15 (gif) / 60 (video) | Output framerate, independent of render rate. |
+| `--record-duration SECONDS` | 10 | Auto-stop after this many wall seconds; `0` means "until you quit (Esc/q)". |
+| `--record-headless` | off | Don't open a window — render to an off-screen surface only. Useful for unattended captures. |
+
+Examples:
+
+```sh
+# 10-second GIF of brickbreaker, headless (no window pops up):
+uv run tools/test_visual.py brickbreaker \
+    --record brickbreaker.gif --record-headless
+
+# 30-second MP4 of snake at 30 fps:
+uv run tools/test_visual.py snake \
+    --record snake.mp4 --record-fps 30 --record-duration 30
+
+# Interactive — open the window, drive it with the keyboard panel,
+# and stop recording when you quit:
+uv run tools/test_visual.py wave \
+    --record wave.gif --record-duration 0
+```
+
+GIFs go through ffmpeg's `palettegen` + `paletteuse` filter for sane
+colour quality and reasonable file size. Videos use `libx264` at
+CRF 20.
+
 ## Idle / background colour
 
 Set your keyboard's idle ("always-on") color once with `--base R,G,B`
