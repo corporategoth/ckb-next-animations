@@ -242,8 +242,19 @@ class ModePicker:
 
 def _run_ckb(*args):
     log(f"-> {CKB_NEXT_BIN} {' '.join(args)}")
+    # ckb-next is a Qt GUI binary; even the `--mode`/`--profile` CLI form
+    # constructs a QApplication (to IPC the already-running instance),
+    # which needs a working Qt platform plugin. Run from a systemd user
+    # service the environment may lack WAYLAND_DISPLAY/DISPLAY -- e.g. the
+    # service started before the compositor imported them -- so Qt falls
+    # back to xcb, fails to connect to any display, and aborts (SIGABRT)
+    # before switching mode. The switch is pure IPC and needs no display,
+    # so force the headless "offscreen" platform: it works regardless of
+    # session state. Only a default, so an explicit override still wins.
+    env = dict(os.environ)
+    env.setdefault("QT_QPA_PLATFORM", "offscreen")
     try:
-        subprocess.run([CKB_NEXT_BIN, *args], check=False)
+        subprocess.run([CKB_NEXT_BIN, *args], check=False, env=env)
     except FileNotFoundError:
         warn(f"{CKB_NEXT_BIN!r} not on PATH; cannot switch mode/profile")
 
